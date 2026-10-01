@@ -7,6 +7,7 @@ import "sort"
 type Circuit struct {
 	Name          string
 	Version       int
+	Description   string
 	Constraints   int
 	PublicInputs  int
 	PrivateInputs int
