@@ -22,6 +22,17 @@ var (
 	ErrSetupMissing = StoreError{Kind: "trusted setup missing"}
 	// ErrUnsupportedKind means a job kind other than prove was submitted.
 	ErrUnsupportedKind = StoreError{Kind: "unsupported job kind"}
+	// ErrDefinitionMissing means a frozen version has registered counts but no
+	// imported constraint definition, so it cannot be compiled.
+	ErrDefinitionMissing = StoreError{Kind: "constraint definition missing"}
+	// ErrArtifactMissing means the version has no compiled artifact.
+	ErrArtifactMissing = StoreError{Kind: "compiled artifact missing"}
+	// ErrArtifactMismatch means the supplied hash does not belong to the
+	// target version's compiled artifact.
+	ErrArtifactMismatch = StoreError{Kind: "artifact mismatch"}
+	// ErrInvalidInput means a witness document is malformed or does not match
+	// the version's declared input layout.
+	ErrInvalidInput = StoreError{Kind: "input format error"}
 	// ErrDataCorrupt means the on-disk data file cannot be read safely.
 	ErrDataCorrupt = StoreError{Kind: "data corrupt"}
 )
@@ -76,4 +87,8 @@ func setupMissingf(format string, args ...any) error {
 
 func corruptf(format string, args ...any) error {
 	return StoreError{Kind: ErrDataCorrupt.Kind, Detail: fmt.Sprintf(format, args...)}
+}
+
+func inputFormatf(format string, args ...any) error {
+	return StoreError{Kind: ErrInvalidInput.Kind, Detail: fmt.Sprintf(format, args...)}
 }

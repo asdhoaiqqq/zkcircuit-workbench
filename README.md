@@ -54,6 +54,54 @@ zkcircuit circuit-list --dir DIR
 
 创建已有版本：描述相同则幂等返回原记录；描述不同报 `conflict`（退出码 1），原记录不变。
 
+### 约束定义、编译与输入检查
+
+约束定义从 JSON 文件导入到**草稿**版本，编译只接受**冻结**版本，输入检查必须绑定一次编译产物的哈希。
+
+定义文件形如：
+
+```json
+{
+  "modulus": "7",
+  "constraints": [
+    { "a": [{"wire": 1, "coeff": "1"}], "b": [{"wire": 2, "coeff": "2"}], "c": [{"wire": 0, "coeff": "3"}] }
+  ]
+}
+```
+
+- `modulus` 是十进制字符串，必须是 2 至 2147483647 之间的质数（确定性 Miller–Rabin 判定）。
+- 每条约束含有序的 `a`、`b`、`c` 三个项数组，每项是整数 `wire` + 十进制整数字符串 `coeff`，
+  数组表示“系数乘对应编号值之和”，三者在模数下满足 a×b=c。编号 0 固定为常数 1，随后依次是
+  声明的公开输入、私有输入；空数组表示 0，同一编号可重复（合并）。
+- 约束条数必须等于版本声明的 `--constraints`，引用编号不得超出输入布局。
+- 非法 JSON、非质数、缺字段、非法整数、越界编号或数量不符一律拒绝，**原定义保持不变**。
+
+```bash
+# 向草稿导入定义（整体替换）；版本不存在 not found，冻结版本 frozen
+zkcircuit constraint-import --dir DIR --name N --version V --file def.json
+
+# 仅冻结版本可编译；只登记数量、从未导入定义的版本明确报 "constraint definition missing"
+zkcircuit circuit-compile  --dir DIR --name N --version V
+# 输出: artifact: name=… version=… modulus=… constraints=… hash=<sha256>
+
+# 检查输入必须显式给出编译产物哈希
+zkcircuit input-check --dir DIR --name N --version V --hash HASH --file input.json
+# 满足:   input check: satisfied=true  … hash=…
+# 不满足: input check: satisfied=false … hash=… first_failure=<从1开始的首个失败约束>
+```
+
+产物哈希是规范化约束的 SHA-256，仅 JSON 空白、项顺序、重复项合并、零项增删或系数相差模数倍数时
+保持不变；约束顺序、模数、名称、版本与公开/私有划分变化都会改变哈希。重复编译返回同一产物；新增
+其他版本不影响已有产物。输入文件为 `{"public":[…],"private":[…]}` 两个字符串数组，长度须分别匹配
+声明，值允许任意长度的带负号十进制整数；数组缺失、长度错误或值非法报 `input format error`。
+检查绝不输出私有值，也不会建立证明作业。失败原因彼此可区分：版本未冻结 `not frozen`、缺少编译产物
+`compiled artifact missing`、哈希不属于该版本 `artifact mismatch`。
+
+草稿已有定义时，`circuit-update` 修改三个数量只有在定义仍然合法（约束数与编号布局都匹配）时才整体
+生效，否则拒绝整次修改；冻结后定义不可替换。定义与编译产物随 `data.json` 持久化，重开目录后仍可用于
+相同检查；旧数据目录可正常读取，新增记录损坏或产物与定义不一致时按读取失败拒绝（退出码 3），不覆盖
+原文件。
+
 ### 可信设置
 
 ```bash
@@ -97,8 +145,14 @@ zkcircuit job-list   --dir DIR   # 按编号字典序
 store, err := zkcircuit.Open("./bench-data")
 // store.CreateCircuit / UpdateCircuit / FreezeCircuit / RecordSetup
 // store.SubmitJob / GetJob / ListJobs / GetCircuit / ListCircuits / GetSetup
+// store.ImportConstraints / GetDefinition / CompileCircuit / GetArtifact
+// store.CheckInput / CheckInputFile
 defer store.Close()
 ```
+
+约束相关类型与错误：`Definition`/`Constraint`/`Term` 描述定义，`Artifact` 是编译产物，
+`Witness` 与 `CheckResult` 用于输入检查；错误可按 `ErrDefinitionMissing`、
+`ErrArtifactMissing`、`ErrArtifactMismatch`、`ErrInvalidInput` 用 `errors.Is` 区分。
 
 ## 技术方向
 

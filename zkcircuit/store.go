@@ -31,20 +31,52 @@ const (
 
 // envelope is the persisted state container.
 type envelope struct {
-	Format   int              `json:"format"`
-	Circuits []persistCircuit `json:"circuits"`
-	Setups   []persistSetup   `json:"setups"`
-	Jobs     []persistJob     `json:"jobs"`
+	Format    int               `json:"format"`
+	Circuits  []persistCircuit  `json:"circuits"`
+	Setups    []persistSetup    `json:"setups"`
+	Jobs      []persistJob      `json:"jobs"`
+	Artifacts []persistArtifact `json:"artifacts,omitempty"`
+}
+
+type persistTerm struct {
+	Wire  int    `json:"wire"`
+	Coeff string `json:"coeff"`
+}
+
+type persistConstraint struct {
+	A []persistTerm `json:"a"`
+	B []persistTerm `json:"b"`
+	C []persistTerm `json:"c"`
+}
+
+// persistDefinition is the canonical, already-validated constraint set bound
+// to one circuit version. The public/private partition is owned by the
+// circuit record and is deliberately not duplicated here, so it can never
+// drift from the declared counts.
+type persistDefinition struct {
+	Modulus     string              `json:"modulus"`
+	Constraints []persistConstraint `json:"constraints"`
+}
+
+// persistArtifact is a compiled artifact: the version's identity and
+// constraint count bound to its recomputable SHA-256 hash.
+type persistArtifact struct {
+	Name        string `json:"name"`
+	Version     int    `json:"version"`
+	Modulus     int64  `json:"modulus"`
+	Constraints int    `json:"constraints"`
+	Hash        string `json:"hash"`
 }
 
 type persistCircuit struct {
-	Name          string `json:"name"`
-	Version       int    `json:"version"`
-	Constraints   int    `json:"constraints"`
-	PublicInputs  int    `json:"public_inputs"`
-	PrivateInputs int    `json:"private_inputs"`
-	Frozen        bool   `json:"frozen"`
-	Description   string `json:"description"`
+	Name          string             `json:"name"`
+	Version       int                `json:"version"`
+	Constraints   int                `json:"constraints"`
+	PublicInputs  int                `json:"public_inputs"`
+	PrivateInputs int                `json:"private_inputs"`
+	Frozen        bool               `json:"frozen"`
+	Description   string             `json:"description"`
+	Definition    *persistDefinition `json:"definition,omitempty"`
 }
 
 type persistSetup struct {
@@ -278,6 +310,12 @@ func sortEnvelope(env *envelope) {
 		return env.Setups[i].Version < env.Setups[j].Version
 	})
 	sort.Slice(env.Jobs, func(i, j int) bool { return env.Jobs[i].ID < env.Jobs[j].ID })
+	sort.Slice(env.Artifacts, func(i, j int) bool {
+		if env.Artifacts[i].Name != env.Artifacts[j].Name {
+			return env.Artifacts[i].Name < env.Artifacts[j].Name
+		}
+		return env.Artifacts[i].Version < env.Artifacts[j].Version
+	})
 }
 
 // validateEnvelope re-checks every invariant on load so a tampered or
@@ -302,6 +340,11 @@ func validateEnvelope(env envelope) error {
 		}
 		if c.PublicInputs < 0 || c.PrivateInputs < 0 {
 			return fmt.Errorf("circuit %q v%d: input counts must not be negative", c.Name, c.Version)
+		}
+		if c.Definition != nil {
+			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
+				return err
+			}
 		}
 		circuitOK[key] = true
 	}
@@ -346,6 +389,54 @@ func validateEnvelope(env envelope) error {
 		if !seenSetup[key] {
 			return fmt.Errorf("job %q binds to circuit %q v%d without a trusted setup", j.ID, j.Circuit, j.Version)
 		}
+	}
+	seenArtifact := make(map[[2]string]bool)
+	for i, a := range env.Artifacts {
+		key := [2]string{a.Name, itoa(a.Version)}
+		if !circuitOK[key] {
+			return fmt.Errorf("artifact #%d belongs to unknown circuit %q v%d", i+1, a.Name, a.Version)
+		}
+		c := findPersistCircuit(env.Circuits, a.Name, a.Version)
+		if c == nil || !c.Frozen {
+			return fmt.Errorf("artifact belongs to non-frozen circuit %q v%d", a.Name, a.Version)
+		}
+		if seenArtifact[key] {
+			return fmt.Errorf("artifact for %q v%d appears more than once", a.Name, a.Version)
+		}
+		seenArtifact[key] = true
+		if c.Definition == nil {
+			return fmt.Errorf("artifact for %q v%d has no constraint definition", a.Name, a.Version)
+		}
+		if a.Constraints != c.Constraints {
+			return fmt.Errorf("artifact for %q v%d constraint count %d disagrees with the version's %d",
+				a.Name, a.Version, a.Constraints, c.Constraints)
+		}
+		def, err := definitionFromPersist(*c.Definition, c.PublicInputs, c.PrivateInputs)
+		if err != nil {
+			return fmt.Errorf("artifact for %q v%d cannot be checked against its definition: %w", a.Name, a.Version, err)
+		}
+		if int64(a.Modulus) != def.modulus || len(def.constraints) != a.Constraints {
+			return fmt.Errorf("artifact for %q v%d is inconsistent with its stored definition", a.Name, a.Version)
+		}
+		wantHash := artifactHash(a.Name, a.Version, def)
+		if a.Hash != wantHash {
+			return fmt.Errorf("artifact for %q v%d hash %q does not recompute from the definition (want %q)",
+				a.Name, a.Version, a.Hash, wantHash)
+		}
+	}
+	return nil
+}
+
+// validatePersistDefinition re-validates a stored definition against its
+// version's declared counts: prime modulus, in-range wires and an exact
+// constraint count match.
+func validatePersistDefinition(name string, version, constraints, public, private int, def *persistDefinition) error {
+	parsed, err := definitionFromPersist(*def, public, private)
+	if err != nil {
+		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
+	}
+	if !parsed.compatibleWith(constraints, public, private) {
+		return fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", name, version)
 	}
 	return nil
 }

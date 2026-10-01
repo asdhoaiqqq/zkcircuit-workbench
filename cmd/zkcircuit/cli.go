@@ -22,6 +22,8 @@ type cliFlags struct {
 	id          string
 	attempt     int
 	kind        string
+	file        string
+	hash        string
 }
 
 // newFlagSet builds the shared flag set. Defaults are chosen so the bare
@@ -42,5 +44,7 @@ func newFlagSet(cmd string, out io.Writer) (*flag.FlagSet, *cliFlags) {
 	fs.StringVar(&f.id, "id", "", "作业编号")
 	fs.IntVar(&f.attempt, "attempt", 1, "尝试次数（正整数）")
 	fs.StringVar(&f.kind, "kind", "prove", "作业类型（当前只接受 prove）")
+	fs.StringVar(&f.file, "file", "", "约束定义或输入的 JSON 文件")
+	fs.StringVar(&f.hash, "hash", "", "编译产物 SHA-256 哈希（输入检查必填）")
 	return fs, &f
 }

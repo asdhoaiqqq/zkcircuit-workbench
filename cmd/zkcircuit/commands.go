@@ -18,16 +18,19 @@ const (
 
 // dataCommands is the set of commands backed by a persistent data directory.
 var dataCommands = map[string]bool{
-	"circuit-create": true,
-	"circuit-update": true,
-	"circuit-freeze": true,
-	"circuit-get":    true,
-	"circuit-list":   true,
-	"setup-record":   true,
-	"setup-get":      true,
-	"job-submit":     true,
-	"job-get":        true,
-	"job-list":       true,
+	"circuit-create":    true,
+	"circuit-update":    true,
+	"circuit-freeze":    true,
+	"circuit-get":       true,
+	"circuit-list":      true,
+	"setup-record":      true,
+	"setup-get":         true,
+	"job-submit":        true,
+	"job-get":           true,
+	"job-list":          true,
+	"constraint-import": true,
+	"circuit-compile":   true,
+	"input-check":       true,
 }
 
 // dispatchDataCommand runs cmd with args. handled is false when cmd is not a
@@ -74,6 +77,12 @@ func runDataCommand(cmd string, args []string) int {
 		return cmdJobGet(f)
 	case "job-list":
 		return cmdJobList(f)
+	case "constraint-import":
+		return cmdConstraintImport(f)
+	case "circuit-compile":
+		return cmdCircuitCompile(f)
+	case "input-check":
+		return cmdInputCheck(f)
 	}
 	return exitUsage
 }
@@ -329,5 +338,84 @@ func cmdJobList(f *cliFlags) int {
 	for _, j := range jobs {
 		fmt.Println("job:", formatJob(j))
 	}
+	return exitOK
+}
+
+func cmdConstraintImport(f *cliFlags) int {
+	if ok, code := requireNameVersion("constraint-import", f); !ok {
+		return code
+	}
+	if f.file == "" {
+		fmt.Fprintln(os.Stderr, "error: --file is required for constraint-import")
+		return exitUsage
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	def, err := store.ImportConstraints(f.name, f.version, f.file)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	fmt.Printf("constraints imported: name=%s version=%d modulus=%s constraints=%d\n",
+		f.name, f.version, def.Modulus, len(def.Constraints))
+	return exitOK
+}
+
+func cmdCircuitCompile(f *cliFlags) int {
+	if ok, code := requireNameVersion("circuit-compile", f); !ok {
+		return code
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	artifact, err := store.CompileCircuit(f.name, f.version)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	fmt.Printf("artifact: name=%s version=%d modulus=%d constraints=%d hash=%s\n",
+		artifact.Name, artifact.Version, artifact.Modulus, artifact.Constraints, artifact.Hash)
+	return exitOK
+}
+
+// cmdInputCheck prints the verdict on stdout without ever echoing private
+// values. Both satisfied and unsatisfied assignments are successful
+// evaluations and exit 0; the satisfied= field carries the verdict (with
+// first_failure set when false). Only gating, input-format and data problems
+// use the non-zero error exits.
+func cmdInputCheck(f *cliFlags) int {
+	if ok, code := requireNameVersion("input-check", f); !ok {
+		return code
+	}
+	if f.file == "" {
+		fmt.Fprintln(os.Stderr, "error: --file is required for input-check")
+		return exitUsage
+	}
+	if f.hash == "" {
+		fmt.Fprintln(os.Stderr, "error: --hash is required for input-check")
+		return exitUsage
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	result, err := store.CheckInputFile(f.name, f.version, f.hash, f.file)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	if result.Satisfied {
+		fmt.Printf("input check: satisfied=true name=%s version=%d hash=%s\n",
+			f.name, f.version, result.Hash)
+		return exitOK
+	}
+	fmt.Printf("input check: satisfied=false name=%s version=%d hash=%s first_failure=%d\n",
+		f.name, f.version, result.Hash, result.FirstFailure)
 	return exitOK
 }

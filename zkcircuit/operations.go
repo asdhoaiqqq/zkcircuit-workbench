@@ -68,6 +68,18 @@ func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 		if existing.Frozen {
 			return false, frozenf("circuit %q version %d is frozen and its description cannot be modified", c.Name, c.Version)
 		}
+		// When a definition is already imported, changing the three counts is
+		// only accepted as a whole if the definition stays legal under them
+		// (exact constraint count, all wires inside the new input layout).
+		if existing.Definition != nil {
+			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
+			if perr != nil {
+				return false, corruptf("stored definition for %q v%d is unreadable: %v", c.Name, c.Version, perr)
+			}
+			if !parsed.compatibleWith(c.Constraints, c.PublicInputs, c.PrivateInputs) {
+				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
+			}
+		}
 		existing.Constraints = c.Constraints
 		existing.PublicInputs = c.PublicInputs
 		existing.PrivateInputs = c.PrivateInputs
