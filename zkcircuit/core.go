@@ -5,22 +5,30 @@ import "sort"
 
 // Circuit is one versioned arithmetic circuit.
 type Circuit struct {
-	Name          string
-	Version       int
-	Constraints   int
-	PublicInputs  int
-	PrivateInputs int
-	Frozen        bool
+	Name          string `json:"name"`
+	Version       int    `json:"version"`
+	Constraints   int    `json:"constraints"`
+	PublicInputs  int    `json:"public_inputs"`
+	PrivateInputs int    `json:"private_inputs"`
+	Frozen        bool   `json:"frozen"`
+	// Description is the human-readable description bound to this version.
+	Description string `json:"description"`
 }
 
 // Job is one prove or verify attempt bound to one circuit version.
 type Job struct {
-	ID       string
-	Circuit  string
-	Version  int
-	Kind     string
-	Attempt  int
-	Artifact string
+	ID       string `json:"id"`
+	Circuit  string `json:"circuit"`
+	Version  int    `json:"version"`
+	Kind     string `json:"kind"`
+	Attempt  int    `json:"attempt"`
+	Artifact string `json:"artifact"`
+}
+
+// Setup is a trusted setup record registered for one frozen circuit version.
+type Setup struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
 }
 
 // Validate refuses to run a job against a moved or unfrozen circuit.
