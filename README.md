@@ -79,6 +79,58 @@ zkcircuit job-list   --dir DIR   # 按编号字典序
 相同编号 + 相同请求重复提交返回同一条作业；编号相同内容不同报 `conflict`。
 作业始终绑定提交时的电路版本，后来新增版本不改变查询结果。
 
+### 约束定义、编译与输入检查
+
+电路版本登记的只是数量；约束的实际内容从 JSON 定义文件导入草稿版本。
+定义文件包含十进制字符串 `modulus`（须为 2 至 2147483647 之间的质数）
+与有序的 `constraints` 数组，条数必须等于版本声明的约束数量。每条约束含
+`a`、`b`、`c` 三个项数组，每项由整数 `wire` 与十进制整数字符串 `coeff`
+组成，表示系数乘对应编号值的和；三者在该模数下满足 a×b=c。编号 0 固定为
+常数 1，随后依次是声明的公开输入与私有输入；空项数组表示 0，同一编号可重复。
+
+```bash
+# 导入定义（仅草稿；整体替换已有定义）
+zkcircuit constraint-import --dir DIR --name N --version V --file def.json
+
+# 编译（仅冻结版本；成功输出并保存名称、版本、模数、约束数量与 SHA-256 哈希）
+zkcircuit compile --dir DIR --name N --version V
+
+# 输入检查：--artifact 必须是该版本编译产物的哈希
+zkcircuit check --dir DIR --name N --version V --artifact HASH --input witness.json
+```
+
+定义文件示例：
+
+```json
+{
+  "modulus": "2147483647",
+  "constraints": [
+    {
+      "a": [{"wire": 0, "coeff": "3"}, {"wire": 1, "coeff": "2"}],
+      "b": [{"wire": 2, "coeff": "1"}],
+      "c": [{"wire": 0, "coeff": "6"}, {"wire": 2, "coeff": "2"}]
+    }
+  ]
+}
+```
+
+检查输入文件包含 `public` 与 `private` 两个字符串数组，长度须分别匹配
+声明的公开/私有输入数量；值为任意长度的带负号十进制整数，按模数解释：
+
+```json
+{"public": ["0"], "private": ["6"]}
+```
+
+检查全部约束成立时输出 `satisfied` 与绑定哈希；否则输出 `not satisfied`、
+绑定哈希与从 1 开始的首个失败约束编号。输出不含私有值，也不建立证明作业。
+
+拒绝规则（原定义一律不变）：非法 JSON、非质数模数、缺少字段、非法整数、
+越界编号或约束条数不符均拒绝；冻结后定义不可替换；编译仅接受冻结版本，
+只有数量没有定义的版本明确报“约束定义缺失”。哈希对 JSON 空白、项顺序、
+重复项合并、零项增删或相差模数倍数的系数保持不变；约束顺序、模数、名称、
+版本与输入划分的变化都会反映在哈希中。重复编译返回同一产物，新增其他
+版本不影响已有产物。
+
 ### 退出码
 
 | 码 | 含义 |
@@ -97,6 +149,7 @@ zkcircuit job-list   --dir DIR   # 按编号字典序
 store, err := zkcircuit.Open("./bench-data")
 // store.CreateCircuit / UpdateCircuit / FreezeCircuit / RecordSetup
 // store.SubmitJob / GetJob / ListJobs / GetCircuit / ListCircuits / GetSetup
+// store.ImportConstraints / CompileCircuit / CheckCircuit
 defer store.Close()
 ```
 

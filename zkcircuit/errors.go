@@ -20,6 +20,17 @@ var (
 	ErrNotFrozen = StoreError{Kind: "not frozen"}
 	// ErrSetupMissing means the frozen version has no recorded trusted setup.
 	ErrSetupMissing = StoreError{Kind: "trusted setup missing"}
+	// ErrDefinitionMissing means a frozen version has no imported constraint
+	// definition, so it cannot be compiled.
+	ErrDefinitionMissing = StoreError{Kind: "constraint definition missing"}
+	// ErrArtifactMissing means a frozen version has no compiled artifact.
+	ErrArtifactMissing = StoreError{Kind: "artifact missing"}
+	// ErrArtifactMismatch means a supplied artifact hash is not bound to the
+	// target circuit version.
+	ErrArtifactMismatch = StoreError{Kind: "artifact mismatch"}
+	// ErrInputFormat means a check request's witness arrays are missing,
+	// have the wrong length or carry non-decimal values.
+	ErrInputFormat = StoreError{Kind: "input format error"}
 	// ErrUnsupportedKind means a job kind other than prove was submitted.
 	ErrUnsupportedKind = StoreError{Kind: "unsupported job kind"}
 	// ErrDataCorrupt means the on-disk data file cannot be read safely.
@@ -72,6 +83,10 @@ func notFrozenf(format string, args ...any) error {
 
 func setupMissingf(format string, args ...any) error {
 	return StoreError{Kind: ErrSetupMissing.Kind, Detail: fmt.Sprintf(format, args...)}
+}
+
+func inputFormatf(format string, args ...any) error {
+	return StoreError{Kind: ErrInputFormat.Kind, Detail: fmt.Sprintf(format, args...)}
 }
 
 func corruptf(format string, args ...any) error {

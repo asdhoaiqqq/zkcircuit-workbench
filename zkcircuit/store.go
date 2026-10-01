@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,30 @@ type persistCircuit struct {
 	PrivateInputs int    `json:"private_inputs"`
 	Frozen        bool   `json:"frozen"`
 	Description   string `json:"description"`
+	// Modulus is the decimal field modulus of the imported constraint
+	// definition; empty means no definition has been imported.
+	Modulus string `json:"modulus,omitempty"`
+	// Definition is the canonicalized constraint system. It is present only
+	// together with Modulus.
+	Definition []persistConstraint `json:"definition,omitempty"`
+	// Artifact is the SHA-256 digest of the compiled definition, present
+	// only after a successful compile.
+	Artifact string `json:"artifact,omitempty"`
+}
+
+// persistTerm is one canonicalized term: a non-negative wire and a
+// coefficient reduced to [0, modulus).
+type persistTerm struct {
+	Wire  int    `json:"wire"`
+	Coeff string `json:"coeff"`
+}
+
+// persistConstraint is one canonicalized rank-1 constraint; each side is
+// sorted by wire and contains no zero terms.
+type persistConstraint struct {
+	A []persistTerm `json:"a"`
+	B []persistTerm `json:"b"`
+	C []persistTerm `json:"c"`
 }
 
 type persistSetup struct {
@@ -305,6 +330,11 @@ func validateEnvelope(env envelope) error {
 		}
 		circuitOK[key] = true
 	}
+	for i := range env.Circuits {
+		if err := validatePersistDefinition(env.Circuits[i]); err != nil {
+			return err
+		}
+	}
 	seenSetup := make(map[[2]string]bool)
 	for i, p := range env.Setups {
 		key := [2]string{p.Name, itoa(p.Version)}
@@ -357,6 +387,76 @@ func findPersistCircuit(cs []persistCircuit, name string, version int) *persistC
 		}
 	}
 	return nil
+}
+
+// validatePersistDefinition re-checks an imported definition and its artifact
+// binding on load. A record carrying either a modulus, a definition or an
+// artifact must carry all three consistent with the circuit's declared
+// counts; a malformed definition or an artifact that no longer matches the
+// definition is a read failure, never something the workbench silently
+// repairs or overwrites.
+func validatePersistDefinition(c persistCircuit) error {
+	hasDef := c.Modulus != "" || len(c.Definition) > 0 || c.Artifact != ""
+	if !hasDef {
+		return nil
+	}
+	if c.Modulus == "" {
+		return fmt.Errorf("circuit %q v%d carries a constraint definition but no modulus", c.Name, c.Version)
+	}
+	m, err := parseModulus(c.Modulus)
+	if err != nil {
+		return fmt.Errorf("circuit %q v%d has an invalid modulus: %v", c.Name, c.Version, err)
+	}
+	if len(c.Definition) == 0 {
+		return fmt.Errorf("circuit %q v%d carries a modulus but no constraint definition", c.Name, c.Version)
+	}
+	if len(c.Definition) != c.Constraints {
+		return fmt.Errorf("circuit %q v%d: definition has %d constraints but %d are declared",
+			c.Name, c.Version, len(c.Definition), c.Constraints)
+	}
+	maxWire := c.PublicInputs + c.PrivateInputs
+	for i, con := range c.Definition {
+		for _, side := range []struct {
+			name  string
+			terms []persistTerm
+		}{{"a", con.A}, {"b", con.B}, {"c", con.C}} {
+			for _, t := range side.terms {
+				if t.Wire < 0 || t.Wire > maxWire {
+					return fmt.Errorf("circuit %q v%d constraint #%d field %q references wire %d outside 0..%d",
+						c.Name, c.Version, i+1, side.name, t.Wire, maxWire)
+				}
+				coeff, ok := new(big.Int).SetString(t.Coeff, 10)
+				if !ok || coeff.Sign() < 0 || coeff.Cmp(m) >= 0 {
+					return fmt.Errorf("circuit %q v%d constraint #%d field %q has a non-canonical coefficient %q",
+						c.Name, c.Version, i+1, side.name, t.Coeff)
+				}
+			}
+		}
+	}
+	if c.Artifact != "" {
+		if !isHex64(c.Artifact) {
+			return fmt.Errorf("circuit %q v%d carries a malformed artifact hash", c.Name, c.Version)
+		}
+		digest := artifactDigest(c.Name, c.Version, c.Modulus, c.PublicInputs, c.PrivateInputs, len(c.Definition), c.Definition)
+		if digest != c.Artifact {
+			return fmt.Errorf("circuit %q v%d artifact hash does not match its constraint definition", c.Name, c.Version)
+		}
+	}
+	return nil
+}
+
+// isHex64 reports whether s is exactly 64 lowercase hexadecimal characters.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		r := s[i]
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func itoa(v int) string { return fmt.Sprintf("%d", v) }

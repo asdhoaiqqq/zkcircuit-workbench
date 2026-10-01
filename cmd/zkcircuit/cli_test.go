@@ -173,6 +173,129 @@ func TestCLIFullLifecycle(t *testing.T) {
 	}
 }
 
+func TestCLIConstraintLifecycle(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bench")
+	r := func(args ...string) (int, string, string) { return runCapture(t, args...) }
+
+	// Create a draft version with 2 constraints, 1 public, 1 private.
+	if code, _, errOut := r("circuit-create", "--dir", dir, "--name", "mul", "--version", "1",
+		"--constraints", "2", "--public-inputs", "1", "--private-inputs", "1",
+		"--description", "demo"); code != 0 {
+		t.Fatalf("create: %s", errOut)
+	}
+
+	// Missing --file is a usage error.
+	if code, _, _ := r("constraint-import", "--dir", dir, "--name", "mul", "--version", "1"); code != 2 {
+		t.Fatalf("import without --file: want exit 2, got %d", code)
+	}
+
+	defFile := filepath.Join(t.TempDir(), "def.json")
+	os.WriteFile(defFile, []byte(`{
+		"modulus": "2147483647",
+		"constraints": [
+			{"a":[{"wire":0,"coeff":"3"},{"wire":1,"coeff":"2"}],"b":[{"wire":2,"coeff":"1"}],"c":[{"wire":0,"coeff":"6"},{"wire":2,"coeff":"2"}]},
+			{"a":[{"wire":1,"coeff":"1"}],"b":[{"wire":1,"coeff":"1"}],"c":[{"wire":1,"coeff":"1"}]}
+		]
+	}`), 0o644)
+	if code, out, errOut := r("constraint-import", "--dir", dir, "--name", "mul", "--version", "1",
+		"--file", defFile); code != 0 || !strings.Contains(out, "constraints=2") {
+		t.Fatalf("import: code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// Illegal definition: count mismatch is rejected, state unchanged.
+	badFile := filepath.Join(t.TempDir(), "bad.json")
+	os.WriteFile(badFile, []byte(`{"modulus":"2","constraints":[]}`), 0o644)
+	if code, _, _ := r("constraint-import", "--dir", dir, "--name", "mul", "--version", "1",
+		"--file", badFile); code != 1 {
+		t.Fatalf("bad import: want exit 1, got %d", code)
+	}
+
+	// Compile before freeze: not frozen.
+	if code, _, _ := r("compile", "--dir", dir, "--name", "mul", "--version", "1"); code != 1 {
+		t.Fatalf("compile draft: want exit 1, got %d", code)
+	}
+	if code, _, errOut := r("circuit-freeze", "--dir", dir, "--name", "mul", "--version", "1"); code != 0 {
+		t.Fatalf("freeze: %s", errOut)
+	}
+	code, out, errOut := r("compile", "--dir", dir, "--name", "mul", "--version", "1")
+	if code != 0 || !strings.Contains(out, "compiled:") || !strings.Contains(out, "artifact=") {
+		t.Fatalf("compile: code=%d out=%q err=%q", code, out, errOut)
+	}
+	// Idempotent compile.
+	code, out2, _ := r("compile", "--dir", dir, "--name", "mul", "--version", "1")
+	if code != 0 || out2 != out {
+		t.Fatalf("recompile differs: %q vs %q", out, out2)
+	}
+	artifact := strings.TrimSpace(strings.Split(out, "artifact=")[1])
+
+	// Check a satisfying witness: p=0, q=6.
+	witFile := filepath.Join(t.TempDir(), "wit.json")
+	os.WriteFile(witFile, []byte(`{"public":["0"],"private":["6"]}`), 0o644)
+	code, out, errOut = r("check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--artifact", artifact, "--input", witFile)
+	if code != 0 || !strings.Contains(out, "satisfied:") {
+		t.Fatalf("check satisfied: code=%d out=%q err=%q", code, out, errOut)
+	}
+	// The output must never carry witness values or private data.
+	if strings.Contains(out, "private") || strings.Contains(out, "failed") {
+		t.Fatalf("check output leaked private data: %q", out)
+	}
+
+	// Failing witness: p=5, q=7 fails constraint 1.
+	os.WriteFile(witFile, []byte(`{"public":["5"],"private":["7"]}`), 0o644)
+	code, out, _ = r("check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--artifact", artifact, "--input", witFile)
+	if code != 0 ||
+		!strings.Contains(out, "not satisfied:") || !strings.Contains(out, "failed_constraint=1") {
+		t.Fatalf("check not satisfied: code=%d out=%q", code, out)
+	}
+
+	// Bad witness format: missing private array.
+	badWit := filepath.Join(t.TempDir(), "badwit.json")
+	os.WriteFile(badWit, []byte(`{"public":["0"]}`), 0o644)
+	if code, _, _ := r("check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--artifact", artifact, "--input", badWit); code != 1 {
+		t.Fatalf("bad witness: want exit 1, got %d", code)
+	}
+
+	// Wrong artifact hash.
+	if code, _, _ := r("check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--artifact", strings.Repeat("0", 64), "--input", witFile); code != 1 {
+		t.Fatalf("wrong artifact: want exit 1, got %d", code)
+	}
+
+	// Reopen: definition and artifact survive.
+	if code, out, _ := r("check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--artifact", artifact, "--input", witFile); code != 0 || !strings.Contains(out, "not satisfied:") {
+		t.Fatalf("check after reopen: code=%d out=%q", code, out)
+	}
+}
+
+func TestCLICompileWithoutDefinition(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bench")
+	r := func(args ...string) (int, string, string) { return runCapture(t, args...) }
+
+	if code, _, _ := r("circuit-create", "--dir", dir, "--name", "c", "--version", "1",
+		"--constraints", "1"); code != 0 {
+		t.Fatal("create")
+	}
+	if code, _, _ := r("circuit-freeze", "--dir", dir, "--name", "c", "--version", "1"); code != 0 {
+		t.Fatal("freeze")
+	}
+	if code, _, errOut := r("compile", "--dir", dir, "--name", "c", "--version", "1"); code != 1 ||
+		!strings.Contains(errOut, "constraint definition missing") {
+		t.Fatalf("compile without definition: code=%d err=%q", code, errOut)
+	}
+	// Check on a frozen version without artifact reports artifact missing.
+	witFile := filepath.Join(t.TempDir(), "w.json")
+	os.WriteFile(witFile, []byte(`{"public":[],"private":[]}`), 0o644)
+	if code, _, errOut := r("check", "--dir", dir, "--name", "c", "--version", "1",
+		"--artifact", strings.Repeat("0", 64), "--input", witFile); code != 1 ||
+		!strings.Contains(errOut, "artifact missing") {
+		t.Fatalf("check without artifact: code=%d err=%q", code, errOut)
+	}
+}
+
 func TestCLIPersistenceAndCorruption(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "bench")
 	r := func(args ...string) (int, string, string) { return runCapture(t, args...) }

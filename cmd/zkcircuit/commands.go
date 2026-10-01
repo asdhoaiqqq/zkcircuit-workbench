@@ -18,16 +18,19 @@ const (
 
 // dataCommands is the set of commands backed by a persistent data directory.
 var dataCommands = map[string]bool{
-	"circuit-create": true,
-	"circuit-update": true,
-	"circuit-freeze": true,
-	"circuit-get":    true,
-	"circuit-list":   true,
-	"setup-record":   true,
-	"setup-get":      true,
-	"job-submit":     true,
-	"job-get":        true,
-	"job-list":       true,
+	"circuit-create":    true,
+	"circuit-update":    true,
+	"circuit-freeze":    true,
+	"circuit-get":       true,
+	"circuit-list":      true,
+	"setup-record":      true,
+	"setup-get":         true,
+	"job-submit":        true,
+	"job-get":           true,
+	"job-list":          true,
+	"constraint-import": true,
+	"compile":           true,
+	"check":             true,
 }
 
 // dispatchDataCommand runs cmd with args. handled is false when cmd is not a
@@ -74,6 +77,12 @@ func runDataCommand(cmd string, args []string) int {
 		return cmdJobGet(f)
 	case "job-list":
 		return cmdJobList(f)
+	case "constraint-import":
+		return cmdConstraintImport(f)
+	case "compile":
+		return cmdCompile(f)
+	case "check":
+		return cmdCheck(f)
 	}
 	return exitUsage
 }
@@ -328,6 +337,97 @@ func cmdJobList(f *cliFlags) int {
 	}
 	for _, j := range jobs {
 		fmt.Println("job:", formatJob(j))
+	}
+	return exitOK
+}
+
+func cmdConstraintImport(f *cliFlags) int {
+	if ok, code := requireNameVersion("constraint-import", f); !ok {
+		return code
+	}
+	if f.file == "" {
+		fmt.Fprintln(os.Stderr, "error: --file is required for constraint-import")
+		return exitUsage
+	}
+	raw, err := os.ReadFile(f.file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read definition file %q: %v\n", f.file, err)
+		return exitRule
+	}
+	def, err := zkcircuit.ParseConstraintDefinition(raw)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	c, err := store.ImportConstraints(f.name, f.version, def)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	fmt.Printf("constraints imported: name=%s version=%d modulus=%s constraints=%d\n",
+		c.Name, c.Version, def.Modulus, len(def.Constraints))
+	return exitOK
+}
+
+func cmdCompile(f *cliFlags) int {
+	if ok, code := requireNameVersion("compile", f); !ok {
+		return code
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	art, err := store.CompileCircuit(f.name, f.version)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	fmt.Printf("compiled: name=%s version=%d modulus=%s constraints=%d artifact=%s\n",
+		art.Name, art.Version, art.Modulus, art.Constraints, art.Hash)
+	return exitOK
+}
+
+func cmdCheck(f *cliFlags) int {
+	if ok, code := requireNameVersion("check", f); !ok {
+		return code
+	}
+	if f.artifact == "" {
+		fmt.Fprintln(os.Stderr, "error: --artifact is required for check")
+		return exitUsage
+	}
+	if f.input == "" {
+		fmt.Fprintln(os.Stderr, "error: --input is required for check")
+		return exitUsage
+	}
+	raw, err := os.ReadFile(f.input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read input file %q: %v\n", f.input, err)
+		return exitRule
+	}
+	witness, err := zkcircuit.ParseWitnessFile(raw)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	res, err := store.CheckCircuit(f.name, f.version, f.artifact, witness.Public, witness.Private)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	if res.Satisfied {
+		fmt.Printf("satisfied: name=%s version=%d artifact=%s\n", f.name, f.version, res.ArtifactHash)
+	} else {
+		fmt.Printf("not satisfied: name=%s version=%d artifact=%s failed_constraint=%d\n",
+			f.name, f.version, res.ArtifactHash, res.FailedConstraint)
 	}
 	return exitOK
 }
