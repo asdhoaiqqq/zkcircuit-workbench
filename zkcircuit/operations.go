@@ -175,6 +175,81 @@ func (s *Store) UpdateCircuitPartial(name string, version int, patch PartialCirc
 	return result, err
 }
 
+// CopyCircuit copies a frozen circuit version into a new draft version of the
+// same circuit, identified by toVersion.
+//
+// The source version must exist (ErrNotFound) and be frozen (ErrNotFrozen);
+// the source is checked before any existing target is considered. toVersion
+// must be a positive integer different from version — it need not be
+// consecutive or larger. The copy carries the source's description, the three
+// counts and, when the source has an imported constraint definition, the
+// whole definition (modulus, constraint order and wire layout) in its
+// canonical form. A source with only registered counts and no definition
+// copies into a target that likewise has no definition, ready for a later
+// import. The new version is an ordinary draft: update, partial update,
+// import and freeze all apply to it, and changing it never touches the
+// source's definition, frozen state, compiled artifact or jobs.
+//
+// Trusted setups, compiled artifacts and jobs belong to their own version:
+// the copy gets none of them, and no hash of the source is bound to the
+// target. The target needs its own setup registration before it accepts prove
+// jobs, and once frozen (with a definition) it compiles into an artifact
+// whose hash carries the target's own name+version identity.
+//
+// Repeating the same copy is idempotent: when the target is still a draft
+// whose description, three counts and definition all match the source (by the
+// canonical definition semantics — no definition and some definition are
+// different states), the stored target is returned unchanged and nothing is
+// committed. A frozen target, or a draft target whose description, counts or
+// definition differ — however it was created — yields ErrConflict, and
+// nothing is added or changed.
+func (s *Store) CopyCircuit(name string, version, toVersion int) (Circuit, error) {
+	if err := validateCircuitKey(name, version); err != nil {
+		return Circuit{}, err
+	}
+	if toVersion <= 0 {
+		return Circuit{}, invalidf("circuit %q target version must be a positive integer, got %d", name, toVersion)
+	}
+	if version == toVersion {
+		return Circuit{}, invalidf("circuit %q target version %d must differ from the source version", name, toVersion)
+	}
+
+	var result Circuit
+	err := s.withLock(func() (bool, error) {
+		source := findCircuit(s.data.Circuits, name, version)
+		if source == nil {
+			return false, notFoundf("circuit %q version %d does not exist", name, version)
+		}
+		if !source.Frozen {
+			return false, notFrozenf("circuit %q version %d must be frozen before it can be copied", name, version)
+		}
+		if existing := findCircuit(s.data.Circuits, name, toVersion); existing != nil {
+			if existing.Frozen {
+				return false, conflictf("circuit %q version %d is frozen and cannot be replaced by a copy", name, toVersion)
+			}
+			if existing.Description == source.Description &&
+				existing.Constraints == source.Constraints &&
+				existing.PublicInputs == source.PublicInputs &&
+				existing.PrivateInputs == source.PrivateInputs &&
+				sameDefinition(existing.Definition, source.Definition) {
+				result = circuitFromPersist(*existing)
+				return false, nil
+			}
+			return false, conflictf("circuit %q version %d already exists with different content", name, toVersion)
+		}
+		record := persistCircuit{
+			Name: name, Version: toVersion,
+			Constraints: source.Constraints, PublicInputs: source.PublicInputs, PrivateInputs: source.PrivateInputs,
+			Frozen: false, Description: source.Description,
+			Definition: cloneDefinition(source.Definition),
+		}
+		s.data.Circuits = append(s.data.Circuits, record)
+		result = circuitFromPersist(record)
+		return true, nil
+	})
+	return result, err
+}
+
 // FreezeCircuit freezes a circuit version. Unknown versions yield
 // ErrNotFound. Freezing an already-frozen version returns that version
 // unchanged (idempotent). Once frozen, name, version and the three counts
@@ -464,6 +539,69 @@ func sameJobRequest(stored persistJob, request Job) bool {
 		stored.Kind == request.Kind &&
 		stored.Attempt == request.Attempt &&
 		stored.CompiledHash == request.CompiledHash
+}
+
+// cloneDefinition deep-copies a stored definition so the copy and its source
+// never share mutable state.
+func cloneDefinition(d *persistDefinition) *persistDefinition {
+	if d == nil {
+		return nil
+	}
+	out := persistDefinition{
+		Modulus:     d.Modulus,
+		Constraints: make([]persistConstraint, len(d.Constraints)),
+	}
+	for i, c := range d.Constraints {
+		out.Constraints[i] = persistConstraint{
+			A: cloneTerms(c.A),
+			B: cloneTerms(c.B),
+			C: cloneTerms(c.C),
+		}
+	}
+	return &out
+}
+
+func cloneTerms(ts []persistTerm) []persistTerm {
+	if ts == nil {
+		return nil
+	}
+	return append([]persistTerm(nil), ts...)
+}
+
+// sameDefinition reports whether two stored definitions are equal. Stored
+// definitions are always kept in canonical form, so structural equality is
+// exactly the canonical equality semantics; a missing definition matches only
+// another missing one.
+func sameDefinition(a, b *persistDefinition) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	if a.Modulus != b.Modulus || len(a.Constraints) != len(b.Constraints) {
+		return false
+	}
+	for i := range a.Constraints {
+		if !sameTerms(a.Constraints[i].A, b.Constraints[i].A) ||
+			!sameTerms(a.Constraints[i].B, b.Constraints[i].B) ||
+			!sameTerms(a.Constraints[i].C, b.Constraints[i].C) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameTerms(a, b []persistTerm) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func circuitFromPersist(c persistCircuit) Circuit {
