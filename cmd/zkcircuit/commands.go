@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -47,6 +48,20 @@ func runDataCommand(cmd string, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	// Record which value flags were explicitly provided, so circuit-update
+	// can distinguish "omitted" from "given a default value".
+	fs.Visit(func(fl *flag.Flag) {
+		switch fl.Name {
+		case "constraints":
+			f.constraintsSet = true
+		case "public-inputs":
+			f.publicInSet = true
+		case "private-inputs":
+			f.privateInSet = true
+		case "description":
+			f.descriptionSet = true
+		}
+	})
 	if len(fs.Args()) > 0 {
 		fmt.Fprintf(os.Stderr, "error: %s does not accept positional arguments (got %q)\n", cmd, fs.Args()[0])
 		return exitUsage
@@ -172,7 +187,24 @@ func cmdCircuitUpdate(f *cliFlags) int {
 	}
 	defer store.Close()
 
-	c, err := store.UpdateCircuit(circuitFromFlags(f))
+	// Only explicitly provided fields are changed; omitted fields keep their
+	// stored values. A non-nil pointer — even to zero or the empty string —
+	// replaces the field.
+	patch := zkcircuit.PartialCircuit{}
+	if f.constraintsSet {
+		patch.Constraints = &f.constraints
+	}
+	if f.publicInSet {
+		patch.PublicInputs = &f.publicIn
+	}
+	if f.privateInSet {
+		patch.PrivateInputs = &f.privateIn
+	}
+	if f.descriptionSet {
+		patch.Description = &f.description
+	}
+
+	c, err := store.UpdateCircuitPartial(f.name, f.version, patch)
 	if err != nil {
 		return reportStoreError(err)
 	}

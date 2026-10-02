@@ -24,6 +24,14 @@ type cliFlags struct {
 	kind        string
 	file        string
 	hash        string
+	// Set reports which value flags were explicitly provided on the command
+	// line. circuit-update uses these to tell "omitted" apart from "given a
+	// default value", so an omitted field keeps its stored value instead of
+	// being written back as the flag default.
+	constraintsSet bool
+	publicInSet    bool
+	privateInSet   bool
+	descriptionSet bool
 }
 
 // newFlagSet builds the shared flag set. Defaults are chosen so the bare
