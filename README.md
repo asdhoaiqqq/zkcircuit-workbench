@@ -119,12 +119,19 @@ zkcircuit setup-get    --dir DIR --name N --version V
 
 ```bash
 # 编号非空白、电路名称明确、版本号正整数、尝试次数正整数
-zkcircuit job-submit --dir DIR --id ID --name N --version V --attempt A [--kind prove]
+zkcircuit job-submit --dir DIR --id ID --name N --version V --attempt A [--kind prove] [--hash HASH]
 zkcircuit job-get    --dir DIR --id ID
 zkcircuit job-list   --dir DIR   # 按编号字典序
 ```
 
-相同编号 + 相同请求重复提交返回同一条作业；编号相同内容不同报 `conflict`。
+`--hash` 可选：提供非空哈希时，作业绑定该名称+版本已保存的编译产物，按原字符串精确匹配。
+版本没有编译产物报 `compiled artifact missing`，哈希不一致报 `artifact mismatch`（退出码均为 1，
+库调用可分别用 `errors.Is(err, zkcircuit.ErrArtifactMissing)` / `ErrArtifactMismatch` 区分）。
+其他名称或版本的产物不能借用。绑定成功的作业在 job-submit、job-get、job-list 中显示
+`compiled_hash`；未提供或空字符串保持只登记行为，不显示该字段，之后编译电路也不会补绑。
+
+相同编号 + 相同请求（含相同可选哈希）重复提交返回同一条作业；编号相同内容不同报 `conflict`，
+包括只改哈希或切换是否绑定，且 conflict 判断优先于新请求的产物校验。
 作业始终绑定提交时的电路版本，后来新增版本不改变查询结果。
 
 ### 退出码

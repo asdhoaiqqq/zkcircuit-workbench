@@ -156,6 +156,9 @@ func formatJob(j zkcircuit.Job) string {
 	if j.Artifact != "" {
 		s += " artifact=" + fmt.Sprintf("%q", j.Artifact)
 	}
+	if j.CompiledHash != "" {
+		s += " compiled_hash=" + j.CompiledHash
+	}
 	return s
 }
 
@@ -328,7 +331,7 @@ func cmdJobSubmit(f *cliFlags) int {
 	}
 	defer store.Close()
 
-	job := zkcircuit.Job{ID: f.id, Circuit: f.name, Version: f.version, Kind: f.kind, Attempt: f.attempt}
+	job := zkcircuit.Job{ID: f.id, Circuit: f.name, Version: f.version, Kind: f.kind, Attempt: f.attempt, CompiledHash: f.hash}
 	stored, err := store.SubmitJob(job)
 	if err != nil {
 		return reportStoreError(err)

@@ -23,6 +23,10 @@ type Job struct {
 	Kind     string `json:"kind"`
 	Attempt  int    `json:"attempt"`
 	Artifact string `json:"artifact"`
+	// CompiledHash optionally binds the job to the compiled artifact of the
+	// pinned circuit version. Empty means unbound; a non-empty value must
+	// equal that version's artifact hash exactly.
+	CompiledHash string `json:"compiled_hash,omitempty"`
 }
 
 // Setup is a trusted setup record registered for one frozen circuit version.

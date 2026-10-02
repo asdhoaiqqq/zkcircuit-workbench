@@ -91,6 +91,9 @@ type persistJob struct {
 	Kind     string `json:"kind"`
 	Attempt  int    `json:"attempt"`
 	Artifact string `json:"artifact,omitempty"`
+	// CompiledHash is the optional binding to the pinned version's compiled
+	// artifact, stored exactly as submitted.
+	CompiledHash string `json:"compiled_hash,omitempty"`
 }
 
 // Store is a persistent workbench backed by one local data directory.
@@ -388,6 +391,19 @@ func validateEnvelope(env envelope) error {
 		}
 		if !seenSetup[key] {
 			return fmt.Errorf("job %q binds to circuit %q v%d without a trusted setup", j.ID, j.Circuit, j.Version)
+		}
+		// A recorded compiled-artifact binding must still resolve against the
+		// pinned version's artifact; a dangling or mismatched binding makes
+		// the file unreadable rather than silently dropping the binding.
+		if j.CompiledHash != "" {
+			artifact := findArtifact(env.Artifacts, j.Circuit, j.Version)
+			if artifact == nil {
+				return fmt.Errorf("job %q binds to compiled artifact of %q v%d which is missing", j.ID, j.Circuit, j.Version)
+			}
+			if artifact.Hash != j.CompiledHash {
+				return fmt.Errorf("job %q compiled hash %q does not match the artifact of %q v%d (hash %q)",
+					j.ID, j.CompiledHash, j.Circuit, j.Version, artifact.Hash)
+			}
 		}
 	}
 	seenArtifact := make(map[[2]string]bool)

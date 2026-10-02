@@ -240,10 +240,18 @@ func (s *Store) RecordSetup(name string, version int) (Setup, error) {
 // still a draft) and ErrSetupMissing (no trusted setup for that version). A
 // refused submission leaves no job behind.
 //
-// Resubmitting the same id with the same request returns the stored job;
-// the same id with different content yields ErrConflict. A stored job stays
-// pinned to the version submitted, regardless of circuit versions added
-// later.
+// A non-empty CompiledHash additionally binds the job to the pinned
+// version's compiled artifact, matched as the exact string: a version with
+// no compiled artifact yields ErrArtifactMissing and a hash that differs
+// from that artifact's hash yields ErrArtifactMismatch. Artifacts of other
+// names or versions never satisfy the binding. An empty CompiledHash leaves
+// the job unbound and keeps the register-only behavior.
+//
+// Resubmitting the same id with the same request — including the same
+// optional hash — returns the stored job; the same id with different content
+// yields ErrConflict, reported before any artifact check of the new request.
+// A stored job stays pinned to the version submitted, regardless of circuit
+// versions added later.
 func (s *Store) SubmitJob(job Job) (Job, error) {
 	if strings.TrimSpace(job.ID) == "" {
 		return Job{}, invalidf("job id must be non-empty and not only whitespace")
@@ -282,9 +290,21 @@ func (s *Store) SubmitJob(job Job) (Job, error) {
 			return false, setupMissingf("job %q references frozen circuit %q version %d which has no recorded trusted setup",
 				job.ID, job.Circuit, job.Version)
 		}
+		if job.CompiledHash != "" {
+			artifact := findArtifact(s.data.Artifacts, job.Circuit, job.Version)
+			if artifact == nil {
+				return false, artifactMissingf("job %q references circuit %q version %d which has no compiled artifact",
+					job.ID, job.Circuit, job.Version)
+			}
+			if artifact.Hash != job.CompiledHash {
+				return false, artifactMismatchf("artifact hash %q does not belong to circuit %q version %d (bound hash %q)",
+					job.CompiledHash, job.Circuit, job.Version, artifact.Hash)
+			}
+		}
 		record := persistJob{
 			ID: job.ID, Circuit: job.Circuit, Version: job.Version,
 			Kind: job.Kind, Attempt: job.Attempt, Artifact: job.Artifact,
+			CompiledHash: job.CompiledHash,
 		}
 		s.data.Jobs = append(s.data.Jobs, record)
 		result = jobFromPersist(record)
@@ -442,7 +462,8 @@ func sameJobRequest(stored persistJob, request Job) bool {
 	return stored.Circuit == request.Circuit &&
 		stored.Version == request.Version &&
 		stored.Kind == request.Kind &&
-		stored.Attempt == request.Attempt
+		stored.Attempt == request.Attempt &&
+		stored.CompiledHash == request.CompiledHash
 }
 
 func circuitFromPersist(c persistCircuit) Circuit {
@@ -461,5 +482,6 @@ func jobFromPersist(j persistJob) Job {
 	return Job{
 		ID: j.ID, Circuit: j.Circuit, Version: j.Version,
 		Kind: j.Kind, Attempt: j.Attempt, Artifact: j.Artifact,
+		CompiledHash: j.CompiledHash,
 	}
 }
