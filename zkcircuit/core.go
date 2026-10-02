@@ -23,6 +23,11 @@ type Job struct {
 	Kind     string `json:"kind"`
 	Attempt  int    `json:"attempt"`
 	Artifact string `json:"artifact"`
+	// CompiledHash optionally binds the job to the compiled artifact saved
+	// for this same name+version. When non-empty it must equal that
+	// artifact's hash exactly; it is never borrowed from another version
+	// and never filled in after submission.
+	CompiledHash string `json:"compiled_hash,omitempty"`
 }
 
 // Setup is a trusted setup record registered for one frozen circuit version.

@@ -85,12 +85,13 @@ type persistSetup struct {
 }
 
 type persistJob struct {
-	ID       string `json:"id"`
-	Circuit  string `json:"circuit"`
-	Version  int    `json:"version"`
-	Kind     string `json:"kind"`
-	Attempt  int    `json:"attempt"`
-	Artifact string `json:"artifact,omitempty"`
+	ID           string `json:"id"`
+	Circuit      string `json:"circuit"`
+	Version      int    `json:"version"`
+	Kind         string `json:"kind"`
+	Attempt      int    `json:"attempt"`
+	Artifact     string `json:"artifact,omitempty"`
+	CompiledHash string `json:"compiled_hash,omitempty"`
 }
 
 // Store is a persistent workbench backed by one local data directory.
@@ -422,6 +423,24 @@ func validateEnvelope(env envelope) error {
 		if a.Hash != wantHash {
 			return fmt.Errorf("artifact for %q v%d hash %q does not recompute from the definition (want %q)",
 				a.Name, a.Version, a.Hash, wantHash)
+		}
+	}
+	// A job that carries a compiled-hash binding must still match the
+	// artifact saved for its own name+version: a missing artifact or a hash
+	// that no longer agrees is a data integrity failure, never a reason to
+	// silently drop the binding and keep using the job.
+	for _, j := range env.Jobs {
+		if j.CompiledHash == "" {
+			continue
+		}
+		artifact := findArtifact(env.Artifacts, j.Circuit, j.Version)
+		if artifact == nil {
+			return fmt.Errorf("job %q binds to compiled hash %q but %q v%d has no compiled artifact",
+				j.ID, j.CompiledHash, j.Circuit, j.Version)
+		}
+		if artifact.Hash != j.CompiledHash {
+			return fmt.Errorf("job %q is bound to compiled hash %q, but %q v%d's artifact has hash %q",
+				j.ID, j.CompiledHash, j.Circuit, j.Version, artifact.Hash)
 		}
 	}
 	return nil
