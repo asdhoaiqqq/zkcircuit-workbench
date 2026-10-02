@@ -15,6 +15,20 @@ type Circuit struct {
 	Description string `json:"description"`
 }
 
+// CircuitPatch is a partial modification of one draft circuit version. Each
+// pointer field is applied only when non-nil, so an omitted field is
+// distinguishable from an explicitly supplied zero value: nil
+// PublicInputs/PrivateInputs leaves the stored count untouched, while a
+// pointer to 0 clears it, and a nil Description differs from a pointer to "".
+type CircuitPatch struct {
+	Name          string
+	Version       int
+	Constraints   *int
+	PublicInputs  *int
+	PrivateInputs *int
+	Description   *string
+}
+
 // Job is one prove or verify attempt bound to one circuit version.
 type Job struct {
 	ID       string `json:"id"`

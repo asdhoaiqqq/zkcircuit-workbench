@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -60,7 +61,7 @@ func runDataCommand(cmd string, args []string) int {
 	case "circuit-create":
 		return cmdCircuitCreate(f)
 	case "circuit-update":
-		return cmdCircuitUpdate(f)
+		return cmdCircuitUpdate(fs, f)
 	case "circuit-freeze":
 		return cmdCircuitFreeze(f)
 	case "circuit-get":
@@ -162,7 +163,7 @@ func cmdCircuitCreate(f *cliFlags) int {
 	return exitOK
 }
 
-func cmdCircuitUpdate(f *cliFlags) int {
+func cmdCircuitUpdate(fs *flag.FlagSet, f *cliFlags) int {
 	if ok, code := requireNameVersion("circuit-update", f); !ok {
 		return code
 	}
@@ -172,7 +173,29 @@ func cmdCircuitUpdate(f *cliFlags) int {
 	}
 	defer store.Close()
 
-	c, err := store.UpdateCircuit(circuitFromFlags(f))
+	// circuit-update is a partial modification: only flags given on the
+	// command line change, and an explicit zero/empty value is distinct from
+	// an omitted flag (--public-inputs 0 clears, an omitted flag is kept).
+	// fs.Visit walks exactly the flags that were set.
+	patch := zkcircuit.CircuitPatch{Name: f.name, Version: f.version}
+	fs.Visit(func(fl *flag.Flag) {
+		switch fl.Name {
+		case "constraints":
+			v := f.constraints
+			patch.Constraints = &v
+		case "public-inputs":
+			v := f.publicIn
+			patch.PublicInputs = &v
+		case "private-inputs":
+			v := f.privateIn
+			patch.PrivateInputs = &v
+		case "description":
+			v := f.description
+			patch.Description = &v
+		}
+	})
+
+	c, err := store.PatchCircuit(patch)
 	if err != nil {
 		return reportStoreError(err)
 	}

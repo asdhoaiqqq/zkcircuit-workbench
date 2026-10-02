@@ -49,8 +49,11 @@ func (s *Store) CreateCircuit(c Circuit) (Circuit, error) {
 
 // UpdateCircuit modifies a draft circuit version. It must target an existing,
 // unfrozen version explicitly: unknown versions yield ErrNotFound and frozen
-// versions yield ErrFrozen. On success the counts and description are
-// replaced as one atomic change; partial updates can never be observed.
+// versions yield ErrFrozen. The counts and description are replaced as one
+// atomic change from the complete record passed in — including zero input
+// counts and an empty description — so callers that only want to change some
+// fields must first read the current record, or use PatchCircuit instead.
+// Partial updates can never be observed.
 func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 	if err := validateCircuitKey(c.Name, c.Version); err != nil {
 		return Circuit{}, err
@@ -58,32 +61,89 @@ func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 	if err := validateCounts(c.Constraints, c.PublicInputs, c.PrivateInputs); err != nil {
 		return Circuit{}, err
 	}
+	patch := CircuitPatch{
+		Name: c.Name, Version: c.Version,
+		Constraints:   &c.Constraints,
+		PublicInputs:  &c.PublicInputs,
+		PrivateInputs: &c.PrivateInputs,
+		Description:   &c.Description,
+	}
+	return s.PatchCircuit(patch)
+}
+
+// PatchCircuit applies a partial modification to a draft circuit version.
+// Only the non-nil fields of p are changed: an omitted (nil) constraint count,
+// input count or description keeps the value already committed at the time the
+// operation takes effect, whereas an explicit pointer to 0 or "" clears the
+// value. Unknown versions yield ErrNotFound and frozen versions ErrFrozen.
+//
+// All supplied fields are validated against the resulting record as one
+// atomic change: constraints must stay positive, input counts non-negative,
+// and an already imported constraint definition must remain legal under the
+// resulting counts (exact constraint count, every referenced wire inside the
+// resulting input layout). The stored definition is never deleted or rewritten
+// to make a change legal. If any field is invalid or would invalidate the
+// definition, the whole operation fails with ErrInvalidArgument and every
+// field and the definition keep their previous values.
+//
+// A patch supplying no modifiable field succeeds and returns the current
+// record without committing anything.
+func (s *Store) PatchCircuit(p CircuitPatch) (Circuit, error) {
+	if err := validateCircuitKey(p.Name, p.Version); err != nil {
+		return Circuit{}, err
+	}
 
 	var result Circuit
 	err := s.withLock(func() (bool, error) {
-		existing := findCircuit(s.data.Circuits, c.Name, c.Version)
+		existing := findCircuit(s.data.Circuits, p.Name, p.Version)
 		if existing == nil {
-			return false, notFoundf("circuit %q version %d does not exist", c.Name, c.Version)
+			return false, notFoundf("circuit %q version %d does not exist", p.Name, p.Version)
 		}
 		if existing.Frozen {
-			return false, frozenf("circuit %q version %d is frozen and its description cannot be modified", c.Name, c.Version)
+			return false, frozenf("circuit %q version %d is frozen and its description cannot be modified", p.Name, p.Version)
 		}
-		// When a definition is already imported, changing the three counts is
-		// only accepted as a whole if the definition stays legal under them
-		// (exact constraint count, all wires inside the new input layout).
+
+		// Build the candidate record on a copy; nothing reaches the live
+		// record until every rule has been checked against it.
+		candidate := *existing
+		if p.Constraints != nil {
+			candidate.Constraints = *p.Constraints
+		}
+		if p.PublicInputs != nil {
+			candidate.PublicInputs = *p.PublicInputs
+		}
+		if p.PrivateInputs != nil {
+			candidate.PrivateInputs = *p.PrivateInputs
+		}
+		if p.Description != nil {
+			candidate.Description = *p.Description
+		}
+		if err := validateCounts(candidate.Constraints, candidate.PublicInputs, candidate.PrivateInputs); err != nil {
+			return false, err
+		}
+		// When a definition is already imported, the change is only accepted
+		// if the definition stays legal under the resulting counts (exact
+		// constraint count, all wires inside the new input layout).
 		if existing.Definition != nil {
 			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
 			if perr != nil {
-				return false, corruptf("stored definition for %q v%d is unreadable: %v", c.Name, c.Version, perr)
+				return false, corruptf("stored definition for %q v%d is unreadable: %v", p.Name, p.Version, perr)
 			}
-			if !parsed.compatibleWith(c.Constraints, c.PublicInputs, c.PrivateInputs) {
+			if !parsed.compatibleWith(candidate.Constraints, candidate.PublicInputs, candidate.PrivateInputs) {
 				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
 			}
 		}
-		existing.Constraints = c.Constraints
-		existing.PublicInputs = c.PublicInputs
-		existing.PrivateInputs = c.PrivateInputs
-		existing.Description = c.Description
+
+		anyField := p.Constraints != nil || p.PublicInputs != nil || p.PrivateInputs != nil || p.Description != nil
+		if !anyField {
+			// Nothing to change: report the current record without committing.
+			result = circuitFromPersist(*existing)
+			return false, nil
+		}
+		existing.Constraints = candidate.Constraints
+		existing.PublicInputs = candidate.PublicInputs
+		existing.PrivateInputs = candidate.PrivateInputs
+		existing.Description = candidate.Description
 		result = circuitFromPersist(*existing)
 		return true, nil
 	})

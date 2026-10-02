@@ -40,7 +40,9 @@ go test ./...
 zkcircuit circuit-create --dir DIR --name N --version V \
   [--constraints C] [--public-inputs P] [--private-inputs Q] [--description TEXT]
 
-# 修改必须明确针对草稿：未知版本 not found，冻结版本 frozen
+# 局部修改草稿：只提供想改的字段，未提供的字段保持当前已提交值。
+# 省略参数与显式给出默认值不同：--public-inputs 0 表示清零，
+# --description "" 表示清空描述。
 zkcircuit circuit-update --dir DIR --name N --version V \
   [--constraints C] [--public-inputs P] [--private-inputs Q] [--description TEXT]
 
@@ -53,6 +55,14 @@ zkcircuit circuit-list --dir DIR
 ```
 
 创建已有版本：描述相同则幂等返回原记录；描述不同报 `conflict`（退出码 1），原记录不变。
+
+`circuit-update` 是局部修改：`--constraints`、`--public-inputs`、`--private-inputs`、
+`--description` 只有显式提供才会改动，省略时保持操作生效时的已提交值。省略与显式给出
+零值必须区分——显式 `--public-inputs 0` / `--private-inputs 0` 会清零，显式
+`--description ""` 会清空描述。一次提供多个字段时按全部修改后的整体结果校验：约束数必须
+为正、输入数不得为负；任一字段非法则整次操作失败（退出码 1），描述与所有数量保留原值。
+没有提供任何可修改字段时，已有草稿成功返回当前记录且不产生新版本；未知版本仍报
+`not found`，冻结版本仍报 `frozen`。
 
 ### 约束定义、编译与输入检查
 
@@ -97,10 +107,11 @@ zkcircuit input-check --dir DIR --name N --version V --hash HASH --file input.js
 检查绝不输出私有值，也不会建立证明作业。失败原因彼此可区分：版本未冻结 `not frozen`、缺少编译产物
 `compiled artifact missing`、哈希不属于该版本 `artifact mismatch`。
 
-草稿已有定义时，`circuit-update` 修改三个数量只有在定义仍然合法（约束数与编号布局都匹配）时才整体
-生效，否则拒绝整次修改；冻结后定义不可替换。定义与编译产物随 `data.json` 持久化，重开目录后仍可用于
-相同检查；旧数据目录可正常读取，新增记录损坏或产物与定义不一致时按读取失败拒绝（退出码 3），不覆盖
-原文件。
+草稿已有定义时，`circuit-update` 不是一律拒绝：允许保持定义合法的数量调整，只有当修改后的
+约束条数不等于定义条数、或定义引用的编号超出修改后的输入布局时才拒绝整次修改（退出码 1）；
+校验始终针对修改后的全部字段，描述和所有数量保留原值，定义不会被删除或重写。冻结后定义不可
+替换。定义与编译产物随 `data.json` 持久化，重开目录后仍可用于相同检查；旧数据目录可正常
+读取，新增记录损坏或产物与定义不一致时按读取失败拒绝（退出码 3），不覆盖原文件。
 
 ### 可信设置
 
@@ -143,12 +154,17 @@ zkcircuit job-list   --dir DIR   # 按编号字典序
 
 ```go
 store, err := zkcircuit.Open("./bench-data")
-// store.CreateCircuit / UpdateCircuit / FreezeCircuit / RecordSetup
+// store.CreateCircuit / UpdateCircuit / PatchCircuit / FreezeCircuit / RecordSetup
 // store.SubmitJob / GetJob / ListJobs / GetCircuit / ListCircuits / GetSetup
 // store.ImportConstraints / GetDefinition / CompileCircuit / GetArtifact
 // store.CheckInput / CheckInputFile
 defer store.Close()
 ```
+
+`UpdateCircuit` 仍按传入的完整记录整体替换字段（零输入数量、空描述都按字面值写入）；
+需要局部修改时使用 `PatchCircuit`，其 `Constraints`/`PublicInputs`/`PrivateInputs`
+为 `*int`、`Description` 为 `*string`，nil 表示保持原值，非 nil（包括指向 0 或 ""）
+表示显式设置。
 
 约束相关类型与错误：`Definition`/`Constraint`/`Term` 描述定义，`Artifact` 是编译产物，
 `Witness` 与 `CheckResult` 用于输入检查；错误可按 `ErrDefinitionMissing`、
