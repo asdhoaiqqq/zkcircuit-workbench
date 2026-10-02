@@ -22,6 +22,7 @@ var dataCommands = map[string]bool{
 	"circuit-create":    true,
 	"circuit-update":    true,
 	"circuit-freeze":    true,
+	"circuit-copy":      true,
 	"circuit-get":       true,
 	"circuit-list":      true,
 	"setup-record":      true,
@@ -78,6 +79,8 @@ func runDataCommand(cmd string, args []string) int {
 		return cmdCircuitUpdate(f)
 	case "circuit-freeze":
 		return cmdCircuitFreeze(f)
+	case "circuit-copy":
+		return cmdCircuitCopy(f)
 	case "circuit-get":
 		return cmdCircuitGet(f)
 	case "circuit-list":
@@ -230,6 +233,32 @@ func cmdCircuitFreeze(f *cliFlags) int {
 		return reportStoreError(err)
 	}
 	fmt.Println("circuit frozen:", formatCircuit(c))
+	return exitOK
+}
+
+func cmdCircuitCopy(f *cliFlags) int {
+	if ok, code := requireNameVersion("circuit-copy", f); !ok {
+		return code
+	}
+	if f.toVersion <= 0 {
+		fmt.Fprintln(os.Stderr, "error: --to-version must be a positive integer for circuit-copy")
+		return exitUsage
+	}
+	if f.toVersion == f.version {
+		fmt.Fprintln(os.Stderr, "error: --to-version must differ from --version for circuit-copy")
+		return exitUsage
+	}
+	store, code := openStore(f)
+	if store == nil {
+		return code
+	}
+	defer store.Close()
+
+	c, err := store.CopyCircuit(f.name, f.version, f.toVersion)
+	if err != nil {
+		return reportStoreError(err)
+	}
+	fmt.Println("circuit copied:", formatCircuit(c))
 	return exitOK
 }
 

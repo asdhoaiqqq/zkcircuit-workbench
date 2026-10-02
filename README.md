@@ -47,12 +47,19 @@ zkcircuit circuit-update --dir DIR --name N --version V \
 # 冻结版本；重复冻结返回同一结果。冻结后名称/版本号/三个数量不可再改
 zkcircuit circuit-freeze --dir DIR --name N --version V
 
+# 复制为新草稿：沿用来源的描述、三个数量与约束定义（模数、约束顺序与
+# 编号布局），目标为独立草稿，可继续修改、导入、冻结与编译；来源的
+# 定义、冻结状态、编译产物与已登记作业保持原样
+zkcircuit circuit-copy --dir DIR --name N --version V --to-version W
+
 # 查询：按名称字典序、版本升序
 zkcircuit circuit-get  --dir DIR --name N --version V
 zkcircuit circuit-list --dir DIR
 ```
 
 创建已有版本：描述相同则幂等返回原记录；描述不同报 `conflict`（退出码 1），原记录不变。
+
+`circuit-copy` 的来源必须是已冻结版本：版本不存在报 `not found`，未冻结报 `not frozen`。目标版本号为正整数且须与来源不同，不要求连续或大于来源。目标已存在且为草稿，且描述、三个数量与定义均与来源一致时幂等返回原目标，不新增记录也不覆盖；目标已冻结或上述任一内容已改变一律报 `conflict`。没有定义与有定义是不同状态；定义一致性按现有规范化语义判断。可信设置、编译产物与作业均属于各自版本：复制不为目标生成这些记录，也不把来源哈希绑定给目标。
 
 ### 约束定义、编译与输入检查
 
@@ -150,7 +157,7 @@ zkcircuit job-list   --dir DIR   # 按编号字典序
 
 ```go
 store, err := zkcircuit.Open("./bench-data")
-// store.CreateCircuit / UpdateCircuit / FreezeCircuit / RecordSetup
+// store.CreateCircuit / UpdateCircuit / FreezeCircuit / CopyCircuit / RecordSetup
 // store.SubmitJob / GetJob / ListJobs / GetCircuit / ListCircuits / GetSetup
 // store.ImportConstraints / GetDefinition / CompileCircuit / GetArtifact
 // store.CheckInput / CheckInputFile

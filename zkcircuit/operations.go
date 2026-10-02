@@ -201,6 +201,74 @@ func (s *Store) FreezeCircuit(name string, version int) (Circuit, error) {
 	return result, err
 }
 
+// CopyCircuit creates a new draft version of a circuit name by copying a
+// frozen source version. The target version must be a positive integer
+// different from the source version; it need not be consecutive or greater.
+//
+// The copy carries over the source's description, constraint count, public
+// and private input counts, and — when the source has one — its complete
+// constraint definition (modulus, constraint order and wire layout). A
+// counts-only source produces a counts-only target with no definition. The
+// new draft is fully independent: updating, re-importing or freezing it
+// never touches the source, and the source's compiled artifacts, trusted
+// setup and registered jobs are never copied or bound to the target. The
+// target must register its own setup and compile its own artifact after
+// freezing; the source's hash cannot satisfy the target's input checks or
+// job bindings.
+//
+// Copying is idempotent: if the target already exists as a draft whose
+// description, counts and definition are semantically equal to the source,
+// the stored target is returned unchanged and nothing is written. A frozen
+// target or a target whose description, counts or definition has changed
+// yields ErrConflict. An unknown source yields ErrNotFound and an unfrozen
+// source ErrNotFrozen; the source is always checked before the target.
+func (s *Store) CopyCircuit(name string, version, toVersion int) (Circuit, error) {
+	if err := validateCircuitKey(name, version); err != nil {
+		return Circuit{}, err
+	}
+	if err := validateCircuitKey(name, toVersion); err != nil {
+		return Circuit{}, err
+	}
+	if version == toVersion {
+		return Circuit{}, invalidf("source and target version must differ for circuit %q", name)
+	}
+
+	var result Circuit
+	err := s.withLock(func() (bool, error) {
+		source := findCircuit(s.data.Circuits, name, version)
+		if source == nil {
+			return false, notFoundf("circuit %q version %d does not exist", name, version)
+		}
+		if !source.Frozen {
+			return false, notFrozenf("circuit %q version %d must be frozen before it can be copied as a new draft", name, version)
+		}
+		target := findCircuit(s.data.Circuits, name, toVersion)
+		if target != nil {
+			if target.Frozen {
+				return false, conflictf("circuit %q version %d already exists and is frozen", name, toVersion)
+			}
+			if !circuitCopyMatches(*source, *target) {
+				return false, conflictf("circuit %q version %d already exists with content that differs from the source", name, toVersion)
+			}
+			result = circuitFromPersist(*target)
+			return false, nil
+		}
+		record := persistCircuit{
+			Name: name, Version: toVersion,
+			Constraints: source.Constraints, PublicInputs: source.PublicInputs, PrivateInputs: source.PrivateInputs,
+			Frozen: false, Description: source.Description,
+		}
+		if source.Definition != nil {
+			def := *source.Definition
+			record.Definition = &def
+		}
+		s.data.Circuits = append(s.data.Circuits, record)
+		result = circuitFromPersist(record)
+		return true, nil
+	})
+	return result, err
+}
+
 // RecordSetup records a trusted setup for one frozen circuit version. The
 // record belongs exclusively to that name+version. Unknown versions yield
 // ErrNotFound; non-frozen versions yield ErrNotFrozen. Re-registering a
@@ -472,6 +540,72 @@ func circuitFromPersist(c persistCircuit) Circuit {
 		Constraints: c.Constraints, PublicInputs: c.PublicInputs, PrivateInputs: c.PrivateInputs,
 		Frozen: c.Frozen, Description: c.Description,
 	}
+}
+
+// circuitCopyMatches reports whether target is the same draft content that a
+// copy of source would create: same description, same three counts and a
+// semantically equal constraint definition. Definition equality follows the
+// existing normalization semantics (terms merged per wire, coefficients
+// reduced modulo p, zeros dropped, wires sorted ascending); a missing
+// definition differs from a present one.
+func circuitCopyMatches(source, target persistCircuit) bool {
+	if source.Description != target.Description {
+		return false
+	}
+	if source.Constraints != target.Constraints ||
+		source.PublicInputs != target.PublicInputs ||
+		source.PrivateInputs != target.PrivateInputs {
+		return false
+	}
+	return definitionsEqual(source.Definition, target.Definition, source.PublicInputs, source.PrivateInputs)
+}
+
+// definitionsEqual compares two stored definitions for semantic equality.
+// Both nil is equal; one nil and the other not is different. When both are
+// present they are parsed through the existing normalization pipeline and
+// compared by modulus, constraint count and each side's wire/coefficient
+// pairs. The public/private layout is the source's; the caller has already
+// confirmed the counts match.
+func definitionsEqual(d1, d2 *persistDefinition, public, private int) bool {
+	if d1 == nil && d2 == nil {
+		return true
+	}
+	if d1 == nil || d2 == nil {
+		return false
+	}
+	p1, err := definitionFromPersist(*d1, public, private)
+	if err != nil {
+		return false
+	}
+	p2, err := definitionFromPersist(*d2, public, private)
+	if err != nil {
+		return false
+	}
+	if p1.modulus != p2.modulus || len(p1.constraints) != len(p2.constraints) {
+		return false
+	}
+	for i := range p1.constraints {
+		if !canonicalTermsEqual(p1.constraints[i].a, p2.constraints[i].a) ||
+			!canonicalTermsEqual(p1.constraints[i].b, p2.constraints[i].b) ||
+			!canonicalTermsEqual(p1.constraints[i].c, p2.constraints[i].c) {
+			return false
+		}
+	}
+	return true
+}
+
+// canonicalTermsEqual reports whether two normalized term slices are
+// identical wire-by-wire and coefficient-by-coefficient.
+func canonicalTermsEqual(t1, t2 []parsedTerm) bool {
+	if len(t1) != len(t2) {
+		return false
+	}
+	for i := range t1 {
+		if t1[i].wire != t2[i].wire || t1[i].value != t2[i].value {
+			return false
+		}
+	}
+	return true
 }
 
 func setupFromPersist(p persistSetup) Setup {

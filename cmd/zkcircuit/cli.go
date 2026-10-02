@@ -15,6 +15,7 @@ type cliFlags struct {
 	dir         string
 	name        string
 	version     int
+	toVersion   int
 	constraints int
 	publicIn    int
 	privateIn   int
@@ -44,7 +45,8 @@ func newFlagSet(cmd string, out io.Writer) (*flag.FlagSet, *cliFlags) {
 	var f cliFlags
 	fs.StringVar(&f.dir, "dir", "", "数据目录")
 	fs.StringVar(&f.name, "name", "", "电路名称")
-	fs.IntVar(&f.version, "version", 0, "电路版本号（正整数）")
+	fs.IntVar(&f.version, "version", 0, "源电路版本号（正整数）")
+	fs.IntVar(&f.toVersion, "to-version", 0, "目标电路版本号（正整数，须与源版本不同）")
 	fs.IntVar(&f.constraints, "constraints", 8192, "约束数量（必须大于 0）")
 	fs.IntVar(&f.publicIn, "public-inputs", 0, "公开输入数量（不得为负）")
 	fs.IntVar(&f.privateIn, "private-inputs", 0, "私有输入数量（不得为负）")
