@@ -132,6 +132,94 @@ func TestCLIConstraintLifecycle(t *testing.T) {
 	}
 }
 
+// TestCLIPrivateInputDiagnosticsDoNotLeak drives input-check through the
+// command line and asserts the privacy contract end to end: a malformed
+// private input yields exit code 1 with an "input format error" reason, no
+// check conclusion on stdout, and no private value, character, fragment or
+// object key on either output stream.
+func TestCLIPrivateInputDiagnosticsDoNotLeak(t *testing.T) {
+	work := t.TempDir()
+	dir := filepath.Join(work, "bench")
+	defPath := writeFile(t, work, "def.json", cliDef)
+
+	type res struct {
+		code int
+		out  string
+		err  string
+	}
+	call := func(args ...string) res {
+		c, o, e := runCapture(t, args...)
+		return res{c, o, e}
+	}
+
+	if r := call("circuit-create", "--dir", dir, "--name", "mul", "--version", "1",
+		"--constraints", "1", "--public-inputs", "1", "--private-inputs", "2"); r.code != 0 {
+		t.Fatalf("create: %+v", r)
+	}
+	if r := call("constraint-import", "--dir", dir, "--name", "mul", "--version", "1",
+		"--file", defPath); r.code != 0 {
+		t.Fatalf("import: %+v", r)
+	}
+	if r := call("circuit-freeze", "--dir", dir, "--name", "mul", "--version", "1"); r.code != 0 {
+		t.Fatalf("freeze: %+v", r)
+	}
+	r1 := call("circuit-compile", "--dir", dir, "--name", "mul", "--version", "1")
+	if r1.code != 0 {
+		t.Fatalf("compile: %+v", r1)
+	}
+	hash := strings.TrimSpace(strings.SplitN(strings.SplitAfter(r1.out, "hash=")[1], "\n", 2)[0])
+
+	// Secret tokens planted inside the private section must never surface.
+	const secret = "SECRETK"
+	cases := []struct {
+		name    string
+		content string
+		want    string // actionable detail that must be present
+	}{
+		{"illegal char", `{"public":["2"],"private":["3","123` + secret + `"]}`, "private input #2"},
+		{"empty", `{"public":["2"],"private":["3",""]}`, "the string is empty"},
+		{"minus only", `{"public":["2"],"private":["3","-"]}`, "minus sign without digits"},
+		{"number element", `{"public":["2"],"private":["3",824173]}`, "private input #2"},
+		{"object with dup key", `{"public":["2"],"private":["3",{"` + secret + `":1,"` + secret + `":2}]}`, "private input #2"},
+		{"syntax in private", `{"public":["2"],"private":["3",` + secret + `]}`, "private input group"},
+		{"private length", `{"public":["2"],"private":["3"]}`, "private input length mismatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeFile(t, work, "input-"+tc.name+".json", tc.content)
+			r := call("input-check", "--dir", dir, "--name", "mul", "--version", "1",
+				"--hash", hash, "--file", path)
+			if r.code != 1 {
+				t.Fatalf("want exit 1, got %d (out=%q err=%q)", r.code, r.out, r.err)
+			}
+			if strings.Contains(r.out, "satisfied") {
+				t.Fatalf("a rejected input must not print a check conclusion: %q", r.out)
+			}
+			if !strings.Contains(r.err, "input format error") {
+				t.Fatalf("must keep the input-format category: %q", r.err)
+			}
+			if !strings.Contains(r.err, tc.want) {
+				t.Fatalf("reason must name %q, got %q", tc.want, r.err)
+			}
+			for _, stream := range []string{r.out, r.err} {
+				if strings.Contains(stream, secret) {
+					t.Fatalf("private token leaked on output: %q", stream)
+				}
+			}
+			if tc.name == "number element" && strings.Contains(r.out+r.err, "824173") {
+				t.Fatalf("private numeric element leaked: %q %q", r.out, r.err)
+			}
+		})
+	}
+
+	// A valid input still evaluates normally (exit 0, conclusion printed).
+	good := writeFile(t, work, "good-cli.json", `{"public":["2"],"private":["3","1"]}`)
+	if r := call("input-check", "--dir", dir, "--name", "mul", "--version", "1",
+		"--hash", hash, "--file", good); r.code != 0 || !strings.Contains(r.out, "satisfied=true") {
+		t.Fatalf("valid input should check: %+v", r)
+	}
+}
+
 func TestCLICountsOnlyVersionCannotCompile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "bench")
 	type res struct {

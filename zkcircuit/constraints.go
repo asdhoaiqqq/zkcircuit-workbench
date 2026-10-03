@@ -618,36 +618,33 @@ func parseWitness(raw []byte, public, private int) (Witness, error) {
 // parseWitnessDocument parses and validates a check input document: both
 // arrays must be present and arrays, their lengths must match the
 // declaration, and every value must be an arbitrarily long signed decimal
-// string. Rejections carry their parse error verbatim; parseWitness tags
-// them as input format errors for the file entry point.
+// string. parseWitness tags rejections as input format errors for the file
+// entry point.
+//
+// Diagnostics are privacy-aware: the private section is parsed with a
+// hand-written scanner whose messages never quote document text — no private
+// value, character, fragment, object key or raw token can reach an error.
+// Syntax failures are attributed to the public/private group being scanned
+// when that is reliably known; otherwise only a document-wide "malformed"
+// reason is given. Structural positions (which group, which 1-based input)
+// still identify what to fix.
 func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
-	members, err := strictObject(raw, []string{"public", "private"}, "input")
+	fields, err := scanWitnessEnvelope(raw)
 	if err != nil {
 		return Witness{}, err
 	}
-	publicRaw, err := requireMember(members, "public", "input")
+	pubField, privField := fields["public"], fields["private"]
+	if !pubField.present {
+		return Witness{}, invalidf("input is missing the \"public\" group: it must be an array of %d decimal strings", public)
+	}
+	if !privField.present {
+		return Witness{}, invalidf("input is missing the \"private\" group: it must be an array of %d decimal strings", private)
+	}
+	pubValues, err := parseWitnessArray(pubField.raw, "public", public)
 	if err != nil {
 		return Witness{}, err
 	}
-	privateRaw, err := requireMember(members, "private", "input")
-	if err != nil {
-		return Witness{}, err
-	}
-	parseArray := func(raw json.RawMessage, which string) ([]string, error) {
-		if string(bytes.TrimSpace(raw)) == "null" {
-			return nil, invalidf("input field %q must be an array", which)
-		}
-		var values []string
-		if err := json.Unmarshal(raw, &values); err != nil {
-			return nil, invalidf("input field %q must be an array of decimal strings: %v", which, err)
-		}
-		return values, nil
-	}
-	pubValues, err := parseArray(publicRaw, "public")
-	if err != nil {
-		return Witness{}, err
-	}
-	privValues, err := parseArray(privateRaw, "private")
+	privValues, err := parseWitnessArray(privField.raw, "private", private)
 	if err != nil {
 		return Witness{}, err
 	}
@@ -659,13 +656,16 @@ func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
 // declared number of decimal strings. A nil slice is accepted wherever an
 // empty one would be (an in-API witness declaring zero inputs); unlike the
 // JSON entry point nothing here distinguishes "omitted" from "empty".
-// Values are never echoed for the private group.
+// Private values are never echoed; malformed private strings are identified
+// by their 1-based position only.
 func witnessFromArrays(pubValues, privValues []string, public, private int) (Witness, error) {
 	if len(pubValues) != public {
-		return Witness{}, invalidf("public input length mismatch: got %d values, version declares %d", len(pubValues), public)
+		return Witness{}, invalidf("public input length mismatch: got %d values, version requires an array of %d decimal strings",
+			len(pubValues), public)
 	}
 	if len(privValues) != private {
-		return Witness{}, invalidf("private input length mismatch: got %d values, version declares %d", len(privValues), private)
+		return Witness{}, invalidf("private input length mismatch: got %d values, version requires an array of %d decimal strings",
+			len(privValues), private)
 	}
 	if err := validateWitnessValues(pubValues, "public", true); err != nil {
 		return Witness{}, err
@@ -677,17 +677,471 @@ func witnessFromArrays(pubValues, privValues []string, public, private int) (Wit
 }
 
 // validateWitnessValues checks that every entry is an arbitrarily long
-// signed decimal string. Private values are deliberately not echoed back.
+// signed decimal string. Public values may be echoed with the parser's
+// detailed reason; private values are never echoed, nor is any character or
+// fragment taken from them — only the 1-based position is reported, with a
+// fixed vocabulary describing why the grammar failed.
 func validateWitnessValues(values []string, which string, echo bool) error {
 	for i, v := range values {
 		if _, err := parseBigSignedDecimal(v); err != nil {
 			if echo {
 				return invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
 			}
-			return invalidf("%s input #%d value is not a decimal integer: %v", which, i+1, err)
+			switch {
+			case v == "":
+				return invalidf("%s input #%d is not a decimal integer: the string is empty", which, i+1)
+			case v == "-":
+				return invalidf("%s input #%d is not a decimal integer: it is a minus sign without digits", which, i+1)
+			default:
+				return invalidf("%s input #%d is not a decimal integer", which, i+1)
+			}
 		}
 	}
 	return nil
+}
+
+// ---- private-value-safe witness document scanner --------------------------
+//
+// encoding/json cannot parse this document for us: its errors quote the
+// offending text (e.g. `invalid character 'Q'`), and a generic duplicate-key
+// walk quotes object keys — both leak private material when the failure is in
+// the private section. The scanner below validates JSON syntax by hand and
+// returns only fixed grammar phrases plus the region (public/private/none)
+// that was being scanned; callers turn those into StoreErrors without ever
+// copying bytes out of the document.
+
+// witnessField is one located top-level member of a scanned input document.
+type witnessField struct {
+	raw     []byte
+	present bool
+}
+
+// scanWitnessEnvelope performs a strict syntax pass over an input document
+// and returns the trimmed raw values of its "public" and "private" members.
+// Syntax errors, trailing data, duplicate groups and a non-object document
+// are rejected; an unknown top-level field is rejected by name (an envelope
+// key is structural, not a private value).
+func scanWitnessEnvelope(raw []byte) (map[string]witnessField, error) {
+	data := raw
+	i := skipJSONSpace(data, 0)
+	if i >= len(data) || data[i] != '{' {
+		return nil, invalidf("input document must be a JSON object with \"public\" and \"private\" arrays of decimal strings")
+	}
+	i++ // past '{'
+	fields := make(map[string]witnessField)
+	seen := make(map[string]bool)
+	for {
+		i = skipJSONSpace(data, i)
+		if i >= len(data) {
+			return nil, witnessMalformedf("", "expected a member key or '}'")
+		}
+		if data[i] == '}' {
+			i++
+			break
+		}
+		if data[i] != '"' {
+			return nil, witnessMalformedf("", "expected a member key")
+		}
+		key, next, reason := scanWitnessKey(data, i)
+		if reason != "" {
+			return nil, witnessMalformedf("", reason)
+		}
+		i = skipJSONSpace(data, next)
+		if i >= len(data) || data[i] != ':' {
+			return nil, witnessMalformedf("", "expected ':' after a member key")
+		}
+		if key != "public" && key != "private" {
+			return nil, invalidf("input document has unknown field %q; only \"public\" and \"private\" are allowed", key)
+		}
+		if seen[key] {
+			return nil, invalidf("input document contains the %q group more than once; each group may appear exactly once", key)
+		}
+		seen[key] = true
+		start := i + 1
+		end, reason := scanWitnessValue(data, start)
+		if reason != "" {
+			return nil, witnessMalformedf(key, reason)
+		}
+		fields[key] = witnessField{raw: bytes.TrimSpace(data[start:end]), present: true}
+		i = skipJSONSpace(data, end)
+		if i >= len(data) {
+			return nil, witnessMalformedf("", "expected ',' or '}'")
+		}
+		switch data[i] {
+		case ',':
+			i++
+			continue
+		case '}':
+			i++
+			if skipJSONSpace(data, i) != len(data) {
+				return nil, witnessMalformedf("", "trailing data after the document")
+			}
+			return fields, nil
+		default:
+			return nil, witnessMalformedf("", "expected ',' or '}'")
+		}
+	}
+	if skipJSONSpace(data, i) != len(data) {
+		return nil, witnessMalformedf("", "trailing data after the document")
+	}
+	return fields, nil
+}
+
+// witnessMalformedf builds a syntax rejection. region is "public", "private"
+// or "" (unknown/envelope). The reason is a fixed grammar phrase chosen by
+// the scanner; it never contains bytes read from the document, so it is safe
+// for the private region.
+func witnessMalformedf(region, reason string) error {
+	switch region {
+	case "private":
+		return invalidf("input document is malformed in the private input group: %s", reason)
+	case "public":
+		return invalidf("input document is malformed in the public input group: %s", reason)
+	default:
+		return invalidf("input document is malformed: %s", reason)
+	}
+}
+
+// parseWitnessArray turns a located group value into its string elements.
+// Syntax has already been validated by scanWitnessEnvelope, so this walk only
+// classifies element types (and re-checks duplicate keys inside object
+// elements). Every message names the group and its required form and never
+// quotes an element; a wrong-type element is identified by its 1-based
+// position and JSON type.
+func parseWitnessArray(raw []byte, group string, want int) ([]string, error) {
+	t := bytes.TrimSpace(raw)
+	if string(t) == "null" {
+		return nil, invalidf("input field %q must be an array of %d decimal strings, not null", group, want)
+	}
+	if len(t) == 0 || t[0] != '[' {
+		return nil, invalidf("input field %q must be an array of %d decimal strings", group, want)
+	}
+	dec := json.NewDecoder(bytes.NewReader(t))
+	dec.UseNumber()
+	if _, err := dec.Token(); err != nil { // opening '['
+		return nil, witnessMalformedf(group, "expected a JSON array")
+	}
+	var values []string
+	idx := 0
+	for dec.More() {
+		idx++
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, witnessMalformedf(group, "expected a JSON string element")
+		}
+		switch v := tok.(type) {
+		case string:
+			values = append(values, v)
+		case json.Delim:
+			// Consume the whole object/array (detecting duplicate keys
+			// inside) before reporting the type mismatch; its contents are
+			// never quoted.
+			if err := skipWitnessDecoderRest(dec, v, group, idx); err != nil {
+				return nil, err
+			}
+			return nil, witnessElementTypef(group, idx, witnessContainerKind(v))
+		case json.Number:
+			return nil, witnessElementTypef(group, idx, "a number")
+		case bool:
+			return nil, witnessElementTypef(group, idx, "a boolean")
+		case nil:
+			return nil, witnessElementTypef(group, idx, "null")
+		}
+	}
+	if _, err := dec.Token(); err != nil { // closing ']'
+		return nil, witnessMalformedf(group, "expected the array to close with ']'")
+	}
+	return values, nil
+}
+
+// witnessElementTypef reports a non-string array element by position only.
+func witnessElementTypef(group string, idx int, kind string) error {
+	return invalidf("%s input #%d must be a decimal string (a JSON string), not %s", group, idx, kind)
+}
+
+func witnessContainerKind(d json.Delim) string {
+	if d == '{' {
+		return "an object"
+	}
+	return "an array"
+}
+
+// skipWitnessDecoderRest consumes the remainder of an object/array whose
+// opening delim has already been read. Duplicate keys inside an object are
+// rejected as a malformed group; the offending key is never named. elem is
+// the 1-based position of the array element being inspected.
+func skipWitnessDecoderRest(dec *json.Decoder, open json.Delim, group string, elem int) error {
+	if open == '{' {
+		seen := make(map[string]bool)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return witnessMalformedf(group, "expected an object key")
+			}
+			key, _ := keyTok.(string)
+			if seen[key] {
+				return witnessObjectDupf(group, elem)
+			}
+			seen[key] = true
+			if err := skipWitnessDecoderValue(dec, group, elem); err != nil {
+				return err
+			}
+		}
+	} else {
+		for dec.More() {
+			if err := skipWitnessDecoderValue(dec, group, elem); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return witnessMalformedf(group, "expected the container to close")
+	}
+	return nil
+}
+
+// witnessObjectDupf reports a duplicate key in an object element without
+// naming the key (it may be private data); the element position identifies
+// what to fix.
+func witnessObjectDupf(group string, elem int) error {
+	return invalidf("%s input #%d must be a decimal string (a JSON string), not an object, and the object contains a duplicate key",
+		group, elem)
+}
+
+// skipWitnessDecoderValue consumes one complete JSON value from dec, keeping
+// the duplicate-key rule for every nested object.
+func skipWitnessDecoderValue(dec *json.Decoder, group string, elem int) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return witnessMalformedf(group, "expected a JSON value")
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil // scalar
+	}
+	return skipWitnessDecoderRest(dec, d, group, elem)
+}
+
+// ---- minimal strict JSON syntax scanner -----------------------------------
+//
+// Each scanner returns the index just past the scanned construct and, on
+// failure, a fixed grammar phrase. No phrase and no returned index leaks
+// document text; the caller supplies region attribution.
+
+func skipJSONSpace(data []byte, i int) int {
+	for i < len(data) {
+		switch data[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// scanWitnessKey scans an object key at data[i] == '"' and returns its
+// decoded text (for matching against the structural names only — never for
+// inclusion in an error) and the index past the closing quote.
+func scanWitnessKey(data []byte, i int) (string, int, string) {
+	end, reason := scanJSONStringEnd(data, i)
+	if reason != "" {
+		return "", 0, reason
+	}
+	var key string
+	if err := json.Unmarshal(data[i:end], &key); err != nil {
+		return "", 0, "invalid string escape"
+	}
+	return key, end, ""
+}
+
+// scanWitnessValue scans one complete JSON value of unknown type.
+func scanWitnessValue(data []byte, i int) (int, string) {
+	i = skipJSONSpace(data, i)
+	if i >= len(data) {
+		return 0, "expected a JSON value"
+	}
+	switch data[i] {
+	case '"':
+		end, reason := scanJSONStringEnd(data, i)
+		return end, reason
+	case '{':
+		return scanWitnessObject(data, i)
+	case '[':
+		return scanWitnessArray(data, i)
+	case 't':
+		return scanWitnessLiteral(data, i, "true")
+	case 'f':
+		return scanWitnessLiteral(data, i, "false")
+	case 'n':
+		return scanWitnessLiteral(data, i, "null")
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return scanWitnessNumber(data, i)
+	default:
+		return 0, "expected a JSON value"
+	}
+}
+
+// scanJSONStringEnd validates a JSON string starting at data[start] == '"'
+// and returns the index just past its closing quote.
+func scanJSONStringEnd(data []byte, start int) (int, string) {
+	i := start + 1
+	for i < len(data) {
+		c := data[i]
+		switch {
+		case c == '"':
+			return i + 1, ""
+		case c == '\\':
+			i++
+			if i >= len(data) {
+				return 0, "unterminated string"
+			}
+			switch data[i] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+				i++
+			case 'u':
+				if i+4 >= len(data) {
+					return 0, "invalid string escape"
+				}
+				for k := 1; k <= 4; k++ {
+					if !isJSONHex(data[i+k]) {
+						return 0, "invalid string escape"
+					}
+				}
+				i += 5
+			default:
+				return 0, "invalid string escape"
+			}
+		case c < 0x20:
+			return 0, "unescaped control character in string"
+		default:
+			i++
+		}
+	}
+	return 0, "unterminated string"
+}
+
+func isJSONHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// scanWitnessObject scans an object starting at data[i] == '{'.
+func scanWitnessObject(data []byte, i int) (int, string) {
+	i++ // past '{'
+	i = skipJSONSpace(data, i)
+	if i < len(data) && data[i] == '}' {
+		return i + 1, ""
+	}
+	for {
+		i = skipJSONSpace(data, i)
+		if i >= len(data) || data[i] != '"' {
+			return 0, "expected an object key"
+		}
+		_, next, reason := scanWitnessKey(data, i)
+		if reason != "" {
+			return 0, reason
+		}
+		i = skipJSONSpace(data, next)
+		if i >= len(data) || data[i] != ':' {
+			return 0, "expected ':' after a member key"
+		}
+		end, reason := scanWitnessValue(data, i+1)
+		if reason != "" {
+			return 0, reason
+		}
+		i = skipJSONSpace(data, end)
+		if i >= len(data) {
+			return 0, "expected ',' or '}'"
+		}
+		switch data[i] {
+		case ',':
+			i++
+		case '}':
+			return i + 1, ""
+		default:
+			return 0, "expected ',' or '}'"
+		}
+	}
+}
+
+// scanWitnessArray scans an array starting at data[i] == '['.
+func scanWitnessArray(data []byte, i int) (int, string) {
+	i++ // past '['
+	i = skipJSONSpace(data, i)
+	if i < len(data) && data[i] == ']' {
+		return i + 1, ""
+	}
+	for {
+		end, reason := scanWitnessValue(data, i)
+		if reason != "" {
+			return 0, reason
+		}
+		i = skipJSONSpace(data, end)
+		if i >= len(data) {
+			return 0, "expected ',' or ']'"
+		}
+		switch data[i] {
+		case ',':
+			i = skipJSONSpace(data, i+1)
+			if i >= len(data) {
+				return 0, "expected another array element"
+			}
+		case ']':
+			return i + 1, ""
+		default:
+			return 0, "expected ',' or ']'"
+		}
+	}
+}
+
+func scanWitnessLiteral(data []byte, i int, lit string) (int, string) {
+	if bytes.HasPrefix(data[i:], []byte(lit)) {
+		return i + len(lit), ""
+	}
+	return 0, "invalid literal"
+}
+
+// scanWitnessNumber validates the JSON number grammar at data[i].
+func scanWitnessNumber(data []byte, i int) (int, string) {
+	bad := func() (int, string) { return 0, "invalid number" }
+	if i < len(data) && data[i] == '-' {
+		i++
+	}
+	if i >= len(data) {
+		return bad()
+	}
+	switch {
+	case data[i] == '0':
+		i++
+	case data[i] >= '1' && data[i] <= '9':
+		for i < len(data) && data[i] >= '0' && data[i] <= '9' {
+			i++
+		}
+	default:
+		return bad()
+	}
+	if i < len(data) && data[i] == '.' {
+		i++
+		if i >= len(data) || data[i] < '0' || data[i] > '9' {
+			return bad()
+		}
+		for i < len(data) && data[i] >= '0' && data[i] <= '9' {
+			i++
+		}
+	}
+	if i < len(data) && (data[i] == 'e' || data[i] == 'E') {
+		i++
+		if i < len(data) && (data[i] == '+' || data[i] == '-') {
+			i++
+		}
+		if i >= len(data) || data[i] < '0' || data[i] > '9' {
+			return bad()
+		}
+		for i < len(data) && data[i] >= '0' && data[i] <= '9' {
+			i++
+		}
+	}
+	return i, ""
 }
 
 // evaluate checks every constraint against the witness and returns the
