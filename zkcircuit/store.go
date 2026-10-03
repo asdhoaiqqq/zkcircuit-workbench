@@ -199,7 +199,7 @@ func (s *Store) loadLocked() error {
 		return corruptf("data file %q uses unsupported format version %d (this build supports %d); original file left in place",
 			s.dataPath(), env.Format, FormatVersion)
 	}
-	if err := validateEnvelope(env); err != nil {
+	if err := validateEnvelope(env, raw); err != nil {
 		return corruptf("data file %q failed integrity validation: %v; original file left in place", s.dataPath(), err)
 	}
 	s.data = env
@@ -322,8 +322,25 @@ func sortEnvelope(env *envelope) {
 }
 
 // validateEnvelope re-checks every invariant on load so a tampered or
-// hand-edited file cannot bypass the domain rules.
-func validateEnvelope(env envelope) error {
+// hand-edited file cannot bypass the domain rules. raw is the exact file
+// content env was decoded from: stored constraint definitions are validated
+// against the raw bytes because the typed decode cannot distinguish a
+// missing or null field from a legitimate empty array or zero wire.
+func validateEnvelope(env envelope, raw []byte) error {
+	// rawDefs mirrors the envelope's circuit array but keeps each definition
+	// as undecoded JSON, so the strict definition grammar (required fields,
+	// exact types, no nulls) can be enforced on load.
+	var rawDefs struct {
+		Circuits []struct {
+			Definition json.RawMessage `json:"definition"`
+		} `json:"circuits"`
+	}
+	if err := json.Unmarshal(raw, &rawDefs); err != nil {
+		return fmt.Errorf("cannot re-read circuit definitions: %v", err)
+	}
+	if len(rawDefs.Circuits) != len(env.Circuits) {
+		return fmt.Errorf("circuit records cannot be re-read consistently")
+	}
 	seenCircuit := make(map[[2]string]bool)
 	circuitOK := make(map[[2]string]bool)
 	for i, c := range env.Circuits {
@@ -345,7 +362,7 @@ func validateEnvelope(env envelope) error {
 			return fmt.Errorf("circuit %q v%d: input counts must not be negative", c.Name, c.Version)
 		}
 		if c.Definition != nil {
-			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
+			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, rawDefs.Circuits[i].Definition); err != nil {
 				return err
 			}
 		}
@@ -443,16 +460,24 @@ func validateEnvelope(env envelope) error {
 	return nil
 }
 
-// validatePersistDefinition re-validates a stored definition against its
-// version's declared counts: prime modulus, in-range wires and an exact
-// constraint count match.
-func validatePersistDefinition(name string, version, constraints, public, private int, def *persistDefinition) error {
-	parsed, err := definitionFromPersist(*def, public, private)
-	if err != nil {
-		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
+// validatePersistDefinition re-validates a stored definition from its raw
+// JSON through the same strict grammar used at import time: the definition
+// must be an object carrying modulus as a string and constraints as an
+// array, every constraint must explicitly carry a, b and c arrays, and every
+// term must explicitly carry an integer wire and a string coeff. A missing
+// field, or null in place of any of these fields or of a constraint or term
+// object, is data corruption — never a legitimate zero value — even though
+// the typed envelope decode would silently read a missing or null array as
+// empty and a missing or null wire as the constant wire 0. On top of the
+// grammar the definition must still match the version's declared counts:
+// prime modulus, in-range wires and an exact constraint count.
+func validatePersistDefinition(name string, version, constraints, public, private int, raw json.RawMessage) error {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: the definition must be an object", name, version)
 	}
-	if !parsed.compatibleWith(constraints, public, private) {
-		return fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", name, version)
+	if _, err := parseDefinitionJSON(raw, public, private, constraints); err != nil {
+		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
 	}
 	return nil
 }

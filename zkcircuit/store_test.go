@@ -1,6 +1,7 @@
 package zkcircuit
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -118,6 +119,172 @@ func TestEmptyDirectoryOpensClean(t *testing.T) {
 	// No data file is written while nothing has been committed.
 	if _, err := os.Stat(dataFilePath(dir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected no data file before first commit, got err=%v", err)
+	}
+}
+
+// TestCorruptDefinitionRefused: a stored constraint definition damaged after
+// import — a required field dropped or replaced by null at the definition,
+// constraint or term level, or a null constraint/term object — makes the
+// whole data directory unreadable with ErrDataCorrupt. This holds whether or
+// not the version is frozen and whether or not a compiled artifact exists;
+// in particular a deleted side that was an empty array canonicalizes back to
+// the same artifact hash and must still be refused. The damaged file is left
+// byte-for-byte in place.
+func TestCorruptDefinitionRefused(t *testing.T) {
+	// The legal baseline deliberately exercises both legitimate zero forms:
+	// b and c are empty arrays (zero linear combinations) and a references
+	// wire 0 (the constant 1) explicitly.
+	const legalDef = `{"modulus":"7","constraints":[{"a":[{"wire":0,"coeff":"1"},{"wire":1,"coeff":"1"}],"b":[],"c":[]}]}`
+
+	// seed writes a real store holding the legal definition. When compiled
+	// is true the version is frozen with a setup and a compiled artifact;
+	// otherwise it stays an uncompiled draft.
+	seed := func(t *testing.T, compiled bool) string {
+		t.Helper()
+		dir := t.TempDir()
+		s, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CreateCircuit(Circuit{Name: "c", Version: 1, Constraints: 1, PublicInputs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ImportConstraints("c", 1, writeTempJSON(t, legalDef)); err != nil {
+			t.Fatal(err)
+		}
+		if compiled {
+			if _, err := s.FreezeCircuit("c", 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RecordSetup("c", 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.CompileCircuit("c", 1); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// The seeded directory itself must reopen cleanly.
+		s2, err := Open(dir)
+		if err != nil {
+			t.Fatalf("seeded store does not reopen: %v", err)
+		}
+		if err := s2.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	mutateDefinition := func(t *testing.T, dir string, fn func(def map[string]any)) {
+		t.Helper()
+		raw, err := readDataFile(t, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env map[string]any
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatal(err)
+		}
+		circuit := env["circuits"].([]any)[0].(map[string]any)
+		def, ok := circuit["definition"].(map[string]any)
+		if !ok {
+			t.Fatalf("seeded circuit has no object definition")
+		}
+		fn(def)
+		out, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeDataFile(t, dir, out)
+	}
+
+	constraint := func(def map[string]any) map[string]any {
+		return def["constraints"].([]any)[0].(map[string]any)
+	}
+	term := func(def map[string]any) map[string]any {
+		return constraint(def)["a"].([]any)[0].(map[string]any)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(def map[string]any)
+	}{
+		{"modulus missing", func(def map[string]any) { delete(def, "modulus") }},
+		{"modulus null", func(def map[string]any) { def["modulus"] = nil }},
+		{"constraints missing", func(def map[string]any) { delete(def, "constraints") }},
+		{"constraints null", func(def map[string]any) { def["constraints"] = nil }},
+		{"constraint null", func(def map[string]any) { def["constraints"].([]any)[0] = nil }},
+		// The deleted side was an empty array: canonical form and artifact
+		// hash are unaffected, yet the read must still be refused.
+		{"empty side field deleted", func(def map[string]any) { delete(constraint(def), "b") }},
+		{"side missing", func(def map[string]any) { delete(constraint(def), "c") }},
+		{"side null", func(def map[string]any) { constraint(def)["b"] = nil }},
+		{"term null", func(def map[string]any) { constraint(def)["a"].([]any)[0] = nil }},
+		{"term wire missing", func(def map[string]any) { delete(term(def), "wire") }},
+		{"term wire null", func(def map[string]any) { term(def)["wire"] = nil }},
+		{"term coeff missing", func(def map[string]any) { delete(term(def), "coeff") }},
+		{"term coeff null", func(def map[string]any) { term(def)["coeff"] = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, compiled := range []bool{true, false} {
+				dir := seed(t, compiled)
+				mutateDefinition(t, dir, tc.mutate)
+				damaged, err := readDataFile(t, dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				s, err := Open(dir)
+				if err == nil {
+					s.Close()
+					t.Fatalf("compiled=%v: expected read failure, open succeeded", compiled)
+				}
+				if !errors.Is(err, ErrDataCorrupt) {
+					t.Fatalf("compiled=%v: want ErrDataCorrupt, got %v", compiled, err)
+				}
+				got, rerr := readDataFile(t, dir)
+				if rerr != nil {
+					t.Fatal(rerr)
+				}
+				if string(got) != string(damaged) {
+					t.Fatalf("compiled=%v: open modified the damaged file", compiled)
+				}
+			}
+		})
+	}
+}
+
+// TestNullOrAbsentDefinitionReadsAsNoDefinition: a counts-only record and a
+// record whose definition field is explicitly null keep their historical
+// meaning — no definition imported — and compile keeps reporting the missing
+// constraint definition rather than data corruption.
+func TestNullOrAbsentDefinitionReadsAsNoDefinition(t *testing.T) {
+	cases := []struct {
+		name   string
+		record string
+	}{
+		{"definition field absent", `{"name":"c","version":1,"constraints":1,"public_inputs":0,"private_inputs":0,"frozen":true,"description":"d"}`},
+		{"definition null", `{"name":"c","version":1,"constraints":1,"public_inputs":0,"private_inputs":0,"frozen":true,"description":"d","definition":null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDataFile(t, dir, []byte(`{"format":1,"circuits":[`+tc.record+`],"setups":[],"jobs":[]}`))
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatalf("counts-only record must open cleanly: %v", err)
+			}
+			defer s.Close()
+			if _, err := s.GetDefinition("c", 1); !errors.Is(err, ErrDefinitionMissing) {
+				t.Fatalf("want ErrDefinitionMissing from GetDefinition, got %v", err)
+			}
+			if _, err := s.CompileCircuit("c", 1); !errors.Is(err, ErrDefinitionMissing) {
+				t.Fatalf("want ErrDefinitionMissing from CompileCircuit, got %v", err)
+			}
+		})
 	}
 }
 

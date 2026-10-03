@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -205,6 +206,73 @@ func TestCLIPersistenceAndCorruption(t *testing.T) {
 	code, _, errOut := r("circuit-list", "--dir", dir)
 	if code != 3 || !strings.Contains(errOut, "read failed") {
 		t.Fatalf("corrupt file: code=%d err=%q", code, errOut)
+	}
+	after, err := os.ReadFile(dataFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, bad) {
+		t.Fatal("corrupt file was modified or overwritten")
+	}
+}
+
+// A stored constraint definition damaged after import — here an empty side
+// deleted, which leaves the canonical form and the compiled artifact hash
+// unchanged — must still fail every data command with exit code 3, print no
+// success record and leave the file untouched.
+func TestCLICorruptDefinitionRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bench")
+	r := func(args ...string) (int, string, string) { return runCapture(t, args...) }
+
+	defFile := filepath.Join(t.TempDir(), "def.json")
+	def := `{"modulus":"7","constraints":[{"a":[{"wire":0,"coeff":"1"},{"wire":1,"coeff":"1"}],"b":[],"c":[]}]}`
+	if err := os.WriteFile(defFile, []byte(def), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := r("circuit-create", "--dir", dir, "--name", "c", "--version", "1",
+		"--constraints", "1", "--public-inputs", "1"); code != 0 {
+		t.Fatal("seed create")
+	}
+	if code, _, _ := r("constraint-import", "--dir", dir, "--name", "c", "--version", "1",
+		"--file", defFile); code != 0 {
+		t.Fatal("seed import")
+	}
+	if code, _, _ := r("circuit-freeze", "--dir", dir, "--name", "c", "--version", "1"); code != 0 {
+		t.Fatal("seed freeze")
+	}
+	if code, _, _ := r("circuit-compile", "--dir", dir, "--name", "c", "--version", "1"); code != 0 {
+		t.Fatal("seed compile")
+	}
+
+	dataFile := filepath.Join(dir, "data.json")
+	original, err := os.ReadFile(dataFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(original, &env); err != nil {
+		t.Fatal(err)
+	}
+	circuit := env["circuits"].([]any)[0].(map[string]any)
+	constraint := circuit["definition"].(map[string]any)["constraints"].([]any)[0].(map[string]any)
+	delete(constraint, "b")
+	bad, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataFile, bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"circuit-list", "--dir", dir},
+		{"circuit-get", "--dir", dir, "--name", "c", "--version", "1"},
+		{"circuit-compile", "--dir", dir, "--name", "c", "--version", "1"},
+	} {
+		code, out, errOut := r(args...)
+		if code != 3 || !strings.Contains(errOut, "read failed") || out != "" {
+			t.Fatalf("%v: code=%d out=%q err=%q", args, code, out, errOut)
+		}
 	}
 	after, err := os.ReadFile(dataFile)
 	if err != nil {
