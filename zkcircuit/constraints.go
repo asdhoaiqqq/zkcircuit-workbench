@@ -433,22 +433,9 @@ func parseModulus(s string) (int64, error) {
 // accept '+' and underscore separators, so the grammar is checked by hand
 // before big.Int parses the digits.
 func parseBigSignedDecimal(s string) (*big.Int, error) {
-	if s == "" {
-		return nil, fmt.Errorf("empty string")
-	}
-	digits := s
-	neg := false
-	if s[0] == '-' {
-		if len(s) == 1 {
-			return nil, fmt.Errorf("sign without digits")
-		}
-		neg = true
-		digits = s[1:]
-	}
-	for i := 0; i < len(digits); i++ {
-		if digits[i] < '0' || digits[i] > '9' {
-			return nil, fmt.Errorf("illegal character %q", digits[i])
-		}
+	digits, neg, err := scanSignedDecimal(s)
+	if err != nil {
+		return nil, err
 	}
 	n, ok := new(big.Int).SetString(digits, 10)
 	if !ok {
@@ -458,6 +445,52 @@ func parseBigSignedDecimal(s string) (*big.Int, error) {
 		n.Neg(n)
 	}
 	return n, nil
+}
+
+// scanSignedDecimal validates the hand-checked decimal grammar and returns
+// the unsigned digit text with the sign separated out. The error it returns
+// for an illegal byte deliberately quotes that byte: callers whose input is
+// private (witness values) must not surface it and instead use
+// signedDecimalKind to describe the failure without echoing any input.
+func scanSignedDecimal(s string) (digits string, neg bool, err error) {
+	if s == "" {
+		return "", false, fmt.Errorf("empty string")
+	}
+	if s[0] == '-' {
+		if len(s) == 1 {
+			return "", false, fmt.Errorf("sign without digits")
+		}
+		neg = true
+		s = s[1:]
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return "", false, fmt.Errorf("illegal character %q", s[i])
+		}
+	}
+	return s, neg, nil
+}
+
+// signedDecimalKind classifies a witness string that failed the signed
+// decimal grammar. It never quotes a character from the input: the returned
+// description is structural (empty string / sign without digits / illegal
+// character) so it is safe to report even when the value is private.
+func signedDecimalKind(s string) string {
+	if s == "" {
+		return "empty string"
+	}
+	if s[0] == '-' {
+		if len(s) == 1 {
+			return "sign without digits"
+		}
+		s = s[1:]
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return "illegal character"
+		}
+	}
+	return "not a decimal integer"
 }
 
 func modInt64(v, p int64) int64 {
@@ -616,42 +649,160 @@ func parseWitness(raw []byte, public, private int) (Witness, error) {
 }
 
 // parseWitnessDocument parses and validates a check input document: both
-// arrays must be present and arrays, their lengths must match the
+// groups must be present as arrays, their lengths must match the
 // declaration, and every value must be an arbitrarily long signed decimal
-// string. Rejections carry their parse error verbatim; parseWitness tags
-// them as input format errors for the file entry point.
+// string.
+//
+// Privacy rule. Diagnostics for the private group never quote a private
+// value, a character or fragment taken from one, an object key found inside
+// the private array, or the raw bytes the parser ran into. Private problems
+// are identified structurally instead — the 1-based private input index, the
+// group name and the required shape — so a caller can repair the document
+// without learning its private contents. Public diagnostics keep their full
+// detail. When a document is too damaged to tell which group a token belongs
+// to, it is rejected generically as malformed JSON with no source quoted.
 func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
-	members, err := strictObject(raw, []string{"public", "private"}, "input")
+	members, err := splitWitnessObject(raw)
 	if err != nil {
 		return Witness{}, err
 	}
-	publicRaw, err := requireMember(members, "public", "input")
+	publicRaw, havePublic := members["public"]
+	privateRaw, havePrivate := members["private"]
+	if !havePublic {
+		return Witness{}, invalidf("input is missing required field %q: the public group must be an array of decimal strings", "public")
+	}
+	if !havePrivate {
+		return Witness{}, invalidf("input is missing required field %q: the private group must be an array of decimal strings", "private")
+	}
+	pubValues, err := parsePublicArray(publicRaw)
 	if err != nil {
 		return Witness{}, err
 	}
-	privateRaw, err := requireMember(members, "private", "input")
-	if err != nil {
-		return Witness{}, err
-	}
-	parseArray := func(raw json.RawMessage, which string) ([]string, error) {
-		if string(bytes.TrimSpace(raw)) == "null" {
-			return nil, invalidf("input field %q must be an array", which)
-		}
-		var values []string
-		if err := json.Unmarshal(raw, &values); err != nil {
-			return nil, invalidf("input field %q must be an array of decimal strings: %v", which, err)
-		}
-		return values, nil
-	}
-	pubValues, err := parseArray(publicRaw, "public")
-	if err != nil {
-		return Witness{}, err
-	}
-	privValues, err := parseArray(privateRaw, "private")
+	privValues, err := parsePrivateArray(privateRaw)
 	if err != nil {
 		return Witness{}, err
 	}
 	return witnessFromArrays(pubValues, privValues, public, private)
+}
+
+// splitWitnessObject walks only the top-level {"public":…,"private":…}
+// envelope and returns each member's raw value. It exists to attribute a
+// lexical failure to the right group before the value is decoded, so a
+// syntax error inside the private value can be reported without quoting the
+// character the decoder met there.
+//
+// Top-level key names are fixed schema names ("public"/"private"), so
+// quoting an unknown or duplicated top-level field cannot disclose a
+// private value. A failure while reading a key or the opening/closing brace
+// is unattributable and reported as plain malformed JSON with no source text.
+func splitWitnessObject(raw []byte) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, invalidf("input must be a JSON object with %q and %q arrays", "public", "private")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	open, err := dec.Token()
+	if err != nil || open != json.Delim('{') {
+		return nil, invalidf("input is not valid JSON")
+	}
+	members := make(map[string]json.RawMessage)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, invalidf("input is not valid JSON")
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, invalidf("input is not valid JSON")
+		}
+		if key != "public" && key != "private" {
+			return nil, invalidf("input has unknown field %q: only %q and %q are allowed", key, "public", "private")
+		}
+		if _, duplicated := members[key]; duplicated {
+			return nil, invalidf("input contains duplicate field %q", key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			if key == "private" {
+				// Inside the private section: describe the problem, never the
+				// character, offset or fragment the parser encountered.
+				return nil, invalidf("input field %q is not valid JSON: the private group must be an array of decimal strings", key)
+			}
+			return nil, invalidf("input field %q is not valid JSON: %v", key, err)
+		}
+		members[key] = value
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+		return nil, invalidf("input is not valid JSON")
+	}
+	// Anything after the top-level object (including more JSON tokens) is
+	// trailing data at an unattributable location; report it generically.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, invalidf("input is not valid JSON: trailing data after the object")
+	}
+	return members, nil
+}
+
+// parsePublicArray decodes the public group with full diagnostics. Public
+// input is not confidential, so the underlying parser error — including the
+// offending value — is retained.
+func parsePublicArray(raw json.RawMessage) ([]string, error) {
+	const which = "public"
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil, invalidf("input field %q must be an array of decimal strings, not null", which)
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, invalidf("input field %q must be an array of decimal strings: %v", which, err)
+	}
+	return values, nil
+}
+
+// parsePrivateArray decodes the private group without ever quoting its
+// contents. Each element must be a JSON string; a number, boolean, null,
+// object or nested array is rejected by its 1-based position alone. An
+// object element is rejected at its opening brace and never descended into,
+// so a duplicate key (or any key) inside it cannot be reported.
+func parsePrivateArray(raw json.RawMessage) ([]string, error) {
+	const which = "private"
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" || trimmed[0] != '[' {
+		return nil, invalidf("input field %q must be an array of decimal strings", which)
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if open, err := dec.Token(); err != nil || open != json.Delim('[') {
+		return nil, invalidf("input field %q is not valid JSON: it must be an array of decimal strings", which)
+	}
+	values := []string{}
+	index := 0
+	for dec.More() {
+		index++
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, invalidf("input field %q is not valid JSON: element #%d must be a decimal string", which, index)
+		}
+		switch t := tok.(type) {
+		case string:
+			values = append(values, t)
+		case json.Delim:
+			kind := "array"
+			if t == '{' {
+				kind = "object"
+			}
+			return nil, invalidf("private input #%d must be a decimal string, not an %s", index, kind)
+		case json.Number, float64:
+			return nil, invalidf("private input #%d must be a decimal string, not a number", index)
+		case bool:
+			return nil, invalidf("private input #%d must be a decimal string, not a boolean", index)
+		case nil:
+			return nil, invalidf("private input #%d must be a decimal string, not null", index)
+		}
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
+		return nil, invalidf("input field %q is not valid JSON: it must be an array of decimal strings", which)
+	}
+	return values, nil
 }
 
 // witnessFromArrays applies the single witness grammar and layout rule
@@ -659,13 +810,15 @@ func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
 // declared number of decimal strings. A nil slice is accepted wherever an
 // empty one would be (an in-API witness declaring zero inputs); unlike the
 // JSON entry point nothing here distinguishes "omitted" from "empty".
-// Values are never echoed for the private group.
+// Private values are never echoed; private problems are identified by index.
 func witnessFromArrays(pubValues, privValues []string, public, private int) (Witness, error) {
 	if len(pubValues) != public {
-		return Witness{}, invalidf("public input length mismatch: got %d values, version declares %d", len(pubValues), public)
+		return Witness{}, invalidf("public input array has %d values but the version requires %d decimal strings",
+			len(pubValues), public)
 	}
 	if len(privValues) != private {
-		return Witness{}, invalidf("private input length mismatch: got %d values, version declares %d", len(privValues), private)
+		return Witness{}, invalidf("private input array has %d values but the version requires %d decimal strings",
+			len(privValues), private)
 	}
 	if err := validateWitnessValues(pubValues, "public", true); err != nil {
 		return Witness{}, err
@@ -677,14 +830,16 @@ func witnessFromArrays(pubValues, privValues []string, public, private int) (Wit
 }
 
 // validateWitnessValues checks that every entry is an arbitrarily long
-// signed decimal string. Private values are deliberately not echoed back.
+// signed decimal string. Public values may be echoed with the parser's
+// detailed reason; private values are never quoted, and their failure is
+// described structurally (see signedDecimalKind) with a 1-based index.
 func validateWitnessValues(values []string, which string, echo bool) error {
 	for i, v := range values {
 		if _, err := parseBigSignedDecimal(v); err != nil {
 			if echo {
 				return invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
 			}
-			return invalidf("%s input #%d value is not a decimal integer: %v", which, i+1, err)
+			return invalidf("%s input #%d is not a decimal integer: %s", which, i+1, signedDecimalKind(v))
 		}
 	}
 	return nil
