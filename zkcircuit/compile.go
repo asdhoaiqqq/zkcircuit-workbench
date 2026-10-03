@@ -159,12 +159,54 @@ func (s *Store) GetArtifact(name string, version int) (Artifact, error) {
 // when unsatisfied, the 1-based index of the first failing constraint. No
 // private input value is included in the result and no proof job is created.
 func (s *Store) CheckInput(name string, version int, hash string, witness Witness) (CheckResult, error) {
-	if err := validateCircuitKey(name, version); err != nil {
+	if err := validateCheckRequest(name, version, hash); err != nil {
 		return CheckResult{}, err
 	}
-	if hash == "" {
-		return CheckResult{}, invalidf("an artifact hash is required to check inputs")
+	return s.checkWitness(name, version, hash, func(parsed *canonicalDefinition) (Witness, error) {
+		if err := validateWitness(witness, parsed.public, parsed.private); err != nil {
+			return Witness{}, err
+		}
+		return witness, nil
+	})
+}
+
+// CheckInputFile is CheckInput with the witness read from a JSON file. All
+// gating still runs against the live store, so a missing artifact or version
+// is reported even when the file itself is malformed. An unreadable file is
+// reported before any store access, exactly like a malformed request.
+func (s *Store) CheckInputFile(name string, version int, hash, path string) (CheckResult, error) {
+	if err := validateCheckRequest(name, version, hash); err != nil {
+		return CheckResult{}, err
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return CheckResult{}, inputFormatf("cannot read input file %q: %v", path, err)
+	}
+	return s.checkWitness(name, version, hash, func(parsed *canonicalDefinition) (Witness, error) {
+		return parseWitness(raw, parsed.public, parsed.private)
+	})
+}
+
+// validateCheckRequest checks the arguments both input-check entries share:
+// a well-formed circuit key and a non-empty artifact hash.
+func validateCheckRequest(name string, version int, hash string) error {
+	if err := validateCircuitKey(name, version); err != nil {
+		return err
+	}
+	if hash == "" {
+		return invalidf("an artifact hash is required to check inputs")
+	}
+	return nil
+}
+
+// checkWitness runs the gating and evaluation shared by CheckInput and
+// CheckInputFile. The version must exist, be frozen and have a compiled
+// artifact whose hash equals the requested one; only then does makeWitness
+// produce the assignment (validating a directly passed witness or parsing
+// the file JSON, respectively), which is evaluated against the version's
+// definition. The verdict binds the artifact's own hash and never creates a
+// proof job or mutates the store.
+func (s *Store) checkWitness(name string, version int, hash string, makeWitness func(*canonicalDefinition) (Witness, error)) (CheckResult, error) {
 	var result CheckResult
 	err := s.withLockRead(func() error {
 		circuit := findCircuit(s.data.Circuits, name, version)
@@ -189,55 +231,7 @@ func (s *Store) CheckInput(name string, version int, hash string, witness Witnes
 		if perr != nil {
 			return corruptf("stored definition for %q v%d is unreadable: %v", name, version, perr)
 		}
-		if err := validateWitness(witness, parsed.public, parsed.private); err != nil {
-			return err
-		}
-		failure := parsed.evaluate(witness)
-		result = CheckResult{Satisfied: failure == 0, Hash: artifact.Hash, FirstFailure: failure}
-		return nil
-	})
-	return result, err
-}
-
-// CheckInputFile is CheckInput with the witness read from a JSON file. All
-// gating still runs against the live store, so a missing artifact or version
-// is reported even when the file itself is malformed.
-func (s *Store) CheckInputFile(name string, version int, hash, path string) (CheckResult, error) {
-	if err := validateCircuitKey(name, version); err != nil {
-		return CheckResult{}, err
-	}
-	if hash == "" {
-		return CheckResult{}, invalidf("an artifact hash is required to check inputs")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return CheckResult{}, inputFormatf("cannot read input file %q: %v", path, err)
-	}
-	var result CheckResult
-	err = s.withLockRead(func() error {
-		circuit := findCircuit(s.data.Circuits, name, version)
-		if circuit == nil {
-			return notFoundf("circuit %q version %d does not exist", name, version)
-		}
-		if !circuit.Frozen {
-			return notFrozenf("circuit %q version %d must be frozen before inputs can be checked", name, version)
-		}
-		artifact := findArtifact(s.data.Artifacts, name, version)
-		if artifact == nil {
-			return artifactMissingf("circuit %q version %d has no compiled artifact", name, version)
-		}
-		if artifact.Hash != hash {
-			return artifactMismatchf("artifact hash %q does not belong to circuit %q version %d (bound hash %q)",
-				hash, name, version, artifact.Hash)
-		}
-		if circuit.Definition == nil {
-			return corruptf("artifact for %q v%d exists but its definition is missing", name, version)
-		}
-		parsed, perr := definitionFromPersist(*circuit.Definition, circuit.PublicInputs, circuit.PrivateInputs)
-		if perr != nil {
-			return corruptf("stored definition for %q v%d is unreadable: %v", name, version, perr)
-		}
-		witness, werr := parseWitness(raw, parsed.public, parsed.private)
+		witness, werr := makeWitness(parsed)
 		if werr != nil {
 			return werr
 		}
