@@ -601,12 +601,10 @@ func definitionFromPersist(p persistDefinition, public, private int) (*canonical
 
 // ---- input checking -------------------------------------------------------
 
-// parseWitness validates the check input JSON. Both arrays must be present
-// and arrays, their lengths must match the declaration, and every value must
-// be an arbitrarily long signed decimal string. Every rejection is reported
-// as an input format error, distinct from domain rule failures.
+// parseWitness validates the check input JSON and tags every rejection as an
+// input format error (ErrInvalidInput), distinct from domain rule failures.
 func parseWitness(raw []byte, public, private int) (Witness, error) {
-	w, err := parseWitnessInner(raw, public, private)
+	w, err := parseWitnessDocument(raw, public, private)
 	if err != nil {
 		var se StoreError
 		if errors.As(err, &se) {
@@ -617,7 +615,12 @@ func parseWitness(raw []byte, public, private int) (Witness, error) {
 	return w, nil
 }
 
-func parseWitnessInner(raw []byte, public, private int) (Witness, error) {
+// parseWitnessDocument parses and validates a check input document: both
+// arrays must be present and arrays, their lengths must match the
+// declaration, and every value must be an arbitrarily long signed decimal
+// string. Rejections carry their parse error verbatim; parseWitness tags
+// them as input format errors for the file entry point.
+func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
 	members, err := strictObject(raw, []string{"public", "private"}, "input")
 	if err != nil {
 		return Witness{}, err
@@ -648,24 +651,43 @@ func parseWitnessInner(raw []byte, public, private int) (Witness, error) {
 	if err != nil {
 		return Witness{}, err
 	}
+	return witnessFromArrays(pubValues, privValues, public, private)
+}
+
+// witnessFromArrays applies the single witness grammar and layout rule
+// shared by both check entry points: each group must contain exactly the
+// declared number of decimal strings. A nil slice is accepted wherever an
+// empty one would be (an in-API witness declaring zero inputs); unlike the
+// JSON entry point nothing here distinguishes "omitted" from "empty".
+// Values are never echoed for the private group.
+func witnessFromArrays(pubValues, privValues []string, public, private int) (Witness, error) {
 	if len(pubValues) != public {
 		return Witness{}, invalidf("public input length mismatch: got %d values, version declares %d", len(pubValues), public)
 	}
 	if len(privValues) != private {
 		return Witness{}, invalidf("private input length mismatch: got %d values, version declares %d", len(privValues), private)
 	}
-	for i, v := range pubValues {
-		if _, err := parseBigSignedDecimal(v); err != nil {
-			return Witness{}, invalidf("public input #%d value %q is not a decimal integer: %v", i+1, v, err)
-		}
+	if err := validateWitnessValues(pubValues, "public", true); err != nil {
+		return Witness{}, err
 	}
-	for i, v := range privValues {
-		// The value itself is deliberately not echoed back.
-		if _, err := parseBigSignedDecimal(v); err != nil {
-			return Witness{}, invalidf("private input #%d value is not a decimal integer: %v", i+1, err)
-		}
+	if err := validateWitnessValues(privValues, "private", false); err != nil {
+		return Witness{}, err
 	}
 	return Witness{Public: pubValues, Private: privValues}, nil
+}
+
+// validateWitnessValues checks that every entry is an arbitrarily long
+// signed decimal string. Private values are deliberately not echoed back.
+func validateWitnessValues(values []string, which string, echo bool) error {
+	for i, v := range values {
+		if _, err := parseBigSignedDecimal(v); err != nil {
+			if echo {
+				return invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
+			}
+			return invalidf("%s input #%d value is not a decimal integer: %v", which, i+1, err)
+		}
+	}
+	return nil
 }
 
 // evaluate checks every constraint against the witness and returns the

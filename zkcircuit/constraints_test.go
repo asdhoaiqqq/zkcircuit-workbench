@@ -443,6 +443,130 @@ func TestNoProofJobCreatedByCheck(t *testing.T) {
 	}
 }
 
+// Both entry points run the same binding and verdict rules: the same
+// frozen version, hash and legal inputs yield identical conclusions, and
+// the same gating errors in the same order.
+func TestCheckInputEntryPointsEquivalent(t *testing.T) {
+	s := openTestStore(t)
+	seedDraftWithDef(t, s, "c", 1, 1, 1, validDef)
+	s.FreezeCircuit("c", 1)
+	a, _ := s.CompileCircuit("c", 1)
+
+	docs := map[string]string{
+		"good":       `{"public":["2"],"private":["3"]}`,
+		"negative":   `{"public":["-5"],"private":["-4"]}`,
+		"huge":       `{"public":["7000000000000000000000002"],"private":["3"]}`,
+		"unsatisfy":  `{"public":["2"],"private":["4"]}`,
+		"badwitness": `{"public":["2"]}`,
+	}
+	for name, doc := range docs {
+		t.Run(name, func(t *testing.T) {
+			path := writeTempJSON(t, doc)
+			fileRes, fileErr := s.CheckInputFile("c", 1, a.Hash, path)
+			if name == "badwitness" {
+				if !errors.Is(fileErr, ErrInvalidInput) {
+					t.Fatalf("file entry: want input format error, got %v", fileErr)
+				}
+				// The JSON witness's strict grammar rejects the document
+				// before the shared layout rules run; the in-API witness
+				// instead supplies the arrays directly.
+				if _, err := s.CheckInput("c", 1, a.Hash, Witness{Public: []string{"2", "x"}, Private: []string{"3"}}); !errors.Is(err, ErrInvalidInput) {
+					t.Fatalf("in-API entry: want input format error, got %v", err)
+				}
+				return
+			}
+			if fileErr != nil {
+				t.Fatalf("file entry: %v", fileErr)
+			}
+			w, werr := parseWitness([]byte(doc), 1, 1)
+			if werr != nil {
+				t.Fatal(werr)
+			}
+			directRes, err := s.CheckInput("c", 1, a.Hash, w)
+			if err != nil {
+				t.Fatalf("direct entry: %v", err)
+			}
+			if directRes != fileRes {
+				t.Fatalf("verdicts differ: direct=%+v file=%+v", directRes, fileRes)
+			}
+		})
+	}
+
+	// Empty/nil slices are accepted for declared-zero groups through the
+	// direct entry; the JSON entry needs explicit arrays.
+	zero := `{"modulus":"7","constraints":[
+		{"a":[{"wire":0,"coeff":"1"}],"b":[{"wire":0,"coeff":"1"}],"c":[{"wire":0,"coeff":"1"}]}]}`
+	if _, err := s.CreateCircuit(Circuit{Name: "z", Version: 1, Constraints: 1, Description: "z"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ImportConstraints("z", 1, writeTempJSON(t, zero)); err != nil {
+		t.Fatal(err)
+	}
+	s.FreezeCircuit("z", 1)
+	az, _ := s.CompileCircuit("z", 1)
+	for _, w := range []Witness{
+		{Public: []string{}, Private: []string{}},
+		{Public: nil, Private: nil},
+	} {
+		res, err := s.CheckInput("z", 1, az.Hash, w)
+		if err != nil || !res.Satisfied || res.Hash != az.Hash {
+			t.Fatalf("nil/empty direct witness %+v: %+v %v", w, res, err)
+		}
+	}
+	path := writeTempJSON(t, `{"public":[],"private":[]}`)
+	res, err := s.CheckInputFile("z", 1, az.Hash, path)
+	if err != nil || !res.Satisfied {
+		t.Fatalf("explicit empty JSON arrays: %+v %v", res, err)
+	}
+	for _, doc := range []string{`{"private":[]}`, `{"public":[]}`, `{"public":null,"private":[]}`} {
+		if _, err := s.CheckInputFile("z", 1, az.Hash, writeTempJSON(t, doc)); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("JSON doc %q must stay an input format error, got %v", doc, err)
+		}
+	}
+}
+
+// Gating precedence is identical at both entry points, and a readable but
+// malformed file never masks a failed binding: business errors are reported
+// before the file's contents are parsed.
+func TestCheckInputFileGatingPrecedence(t *testing.T) {
+	s := openTestStore(t)
+	seedDraftWithDef(t, s, "c", 1, 1, 1, validDef)
+	s.FreezeCircuit("c", 1)
+	a, _ := s.CompileCircuit("c", 1)
+	badDoc := writeTempJSON(t, `{not json`)
+
+	if _, err := s.CreateCircuit(Circuit{Name: "d", Version: 1, Constraints: 1, Description: "d"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.CheckInputFile("ghost", 1, a.Hash, badDoc); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown version beats malformed file: %v", err)
+	}
+	if _, err := s.CheckInputFile("d", 1, a.Hash, badDoc); !errors.Is(err, ErrNotFrozen) {
+		t.Fatalf("unfrozen beats malformed file: %v", err)
+	}
+	s.FreezeCircuit("d", 1)
+	if _, err := s.CheckInputFile("d", 1, a.Hash, badDoc); !errors.Is(err, ErrArtifactMissing) {
+		t.Fatalf("missing artifact beats malformed file: %v", err)
+	}
+	if _, err := s.CheckInputFile("c", 1, a.Hash+"00", badDoc); !errors.Is(err, ErrArtifactMismatch) {
+		t.Fatalf("hash mismatch beats malformed file: %v", err)
+	}
+	// Direct entry shares the same order.
+	if _, err := s.CheckInput("ghost", 1, a.Hash, Witness{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("direct unknown version: %v", err)
+	}
+	if _, err := s.CheckInput("c", 1, a.Hash+"00", Witness{Public: []string{"2"}, Private: []string{"3"}}); !errors.Is(err, ErrArtifactMismatch) {
+		t.Fatalf("direct wrong hash: %v", err)
+	}
+
+	// A missing/unreadable file keeps the read error; binding validation
+	// never rewrites it as another cause.
+	if _, err := s.CheckInputFile("c", 1, a.Hash, filepath.Join(t.TempDir(), "missing.json")); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unreadable file must be an input format error, got %v", err)
+	}
+}
+
 func TestCompileArtifactsSurviveReopen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "bench")
 	s, err := Open(dir)
