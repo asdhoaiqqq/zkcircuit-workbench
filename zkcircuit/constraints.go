@@ -241,6 +241,22 @@ func decodeJSONString(raw json.RawMessage, what string) (string, error) {
 	return s, nil
 }
 
+// decodeJSONBool requires raw to be a JSON boolean (true/false; not null,
+// a number or a string).
+func decodeJSONBool(raw json.RawMessage, what string) (bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if string(trimmed) == "true" {
+		return true, nil
+	}
+	if string(trimmed) == "false" {
+		return false, nil
+	}
+	if string(trimmed) == "null" || len(trimmed) == 0 {
+		return false, invalidf("%s must be a JSON boolean, not null", what)
+	}
+	return false, invalidf("%s must be a JSON boolean", what)
+}
+
 // decodeJSONInt requires raw to be a JSON integer (no floats, strings,
 // null).
 func decodeJSONInt(raw json.RawMessage, what string) (int, error) {

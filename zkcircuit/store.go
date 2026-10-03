@@ -1,12 +1,15 @@
 package zkcircuit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -30,12 +33,225 @@ const (
 )
 
 // envelope is the persisted state container.
+//
+// Circuits are kept as raw JSON during decoding so persistCircuit's strict
+// UnmarshalJSON — rather than encoding/json's silent zero-value filling —
+// decides what a committed circuit record may look like. UnmarshalJSON first
+// walks the token stream (scanEnvelopeDuplicates) and rejects a repeated
+// object key anywhere encoding/json would otherwise keep the last value.
 type envelope struct {
 	Format    int               `json:"format"`
 	Circuits  []persistCircuit  `json:"circuits"`
 	Setups    []persistSetup    `json:"setups"`
 	Jobs      []persistJob      `json:"jobs"`
 	Artifacts []persistArtifact `json:"artifacts,omitempty"`
+}
+
+// envelopeWire is the decoding-only shape: circuit records arrive raw so
+// their own strict decoder can require every field explicitly.
+type envelopeWire struct {
+	Format    int               `json:"format"`
+	Circuits  []json.RawMessage `json:"circuits"`
+	Setups    []persistSetup    `json:"setups"`
+	Jobs      []persistJob      `json:"jobs"`
+	Artifacts []persistArtifact `json:"artifacts,omitempty"`
+}
+
+func (e *envelope) UnmarshalJSON(raw []byte) error {
+	// Reject repeated keys before decoding: encoding/json silently keeps the
+	// last value of a duplicate. The walk is layered so a repeated field is
+	// attributed to the record it belongs to (a duplicate "frozen" inside
+	// circuit #3, not a generic envelope complaint).
+	if err := scanEnvelopeDuplicates(raw); err != nil {
+		return err
+	}
+	var wire envelopeWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		var se StoreError
+		if errors.As(err, &se) && se.Kind == ErrDataCorrupt.Kind {
+			return err // an inner record decoder already named the problem
+		}
+		return corruptf("data file envelope is not valid JSON: %v", err)
+	}
+	e.Format = wire.Format
+	e.Setups = wire.Setups
+	e.Jobs = wire.Jobs
+	e.Artifacts = wire.Artifacts
+	if wire.Circuits == nil {
+		e.Circuits = nil
+	} else {
+		e.Circuits = make([]persistCircuit, len(wire.Circuits))
+	}
+	for i, craw := range wire.Circuits {
+		var record persistCircuit
+		if err := json.Unmarshal(craw, &record); err != nil {
+			var se StoreError
+			if errors.As(err, &se) {
+				// Re-tag as one corruption error carrying the record index,
+				// so the detail survives errors.As unwrapping in loadLocked.
+				return StoreError{Kind: ErrDataCorrupt.Kind,
+					Detail: fmt.Sprintf("circuit record #%d: %s", i+1, se.Detail)}
+			}
+			return corruptf("circuit record #%d: %v", i+1, err)
+		}
+		e.Circuits[i] = record
+	}
+	return nil
+}
+
+// scanEnvelopeDuplicates tokenizes the committed envelope and rejects every
+// repeated object key. Circuit records are scanned one level deep only —
+// their top-level fields are checked here (with the record's 1-based index
+// reported), while values such as the constraint definition are skipped and
+// left to their own strict decoders. Every other envelope member is scanned
+// recursively so a duplicated key anywhere in committed data fails the read
+// instead of silently resolving to its last value.
+func scanEnvelopeDuplicates(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
+	dec.UseNumber()
+	open, err := dec.Token()
+	if err != nil || open != json.Delim('{') {
+		return corruptf("data file envelope must be a JSON object")
+	}
+	seenTop := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return corruptf("data file envelope is not valid JSON: %v", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return corruptf("data file envelope is not valid JSON")
+		}
+		if seenTop[key] {
+			return corruptf("data file envelope contains duplicate field %q", key)
+		}
+		seenTop[key] = true
+		if key == "circuits" {
+			if err := scanCircuitArrayDuplicates(dec); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := skipValueWithDupKeys(dec, "data file envelope field "+strconv.Quote(key)); err != nil {
+			return err
+		}
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+		return corruptf("data file envelope is not valid JSON")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return corruptf("data file envelope is not valid JSON: trailing data after the object")
+	}
+	return nil
+}
+
+// scanCircuitArrayDuplicates consumes one "circuits" value positioned at its
+// opening bracket and checks only each record's own top-level keys. A null
+// array stays the pre-existing "no records" reading.
+func scanCircuitArrayDuplicates(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return corruptf("data file envelope field \"circuits\" is not valid JSON: %v", err)
+	}
+	if tok == nil { // null: json.Unmarshal would produce no records
+		return nil
+	}
+	if tok != json.Delim('[') {
+		return corruptf("data file envelope field \"circuits\" must be an array")
+	}
+	index := 0
+	for dec.More() {
+		index++
+		what := fmt.Sprintf("circuit record #%d", index)
+		open, err := dec.Token()
+		if err != nil {
+			return corruptf("%s is not valid JSON: %v", what, err)
+		}
+		if open == nil {
+			return corruptf("%s must be a JSON object, not null", what)
+		}
+		if open != json.Delim('{') {
+			return corruptf("%s must be a JSON object", what)
+		}
+		seen := make(map[string]bool)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return corruptf("%s is not valid JSON: %v", what, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return corruptf("%s is not valid JSON", what)
+			}
+			if seen[key] {
+				return corruptf("%s contains duplicate field %q", what, key)
+			}
+			seen[key] = true
+			// Skip the whole value without descending: nested objects
+			// (definition) own their own strict duplicate checks.
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return corruptf("%s is not valid JSON: %v", what, err)
+			}
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+			return corruptf("%s is not valid JSON", what)
+		}
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
+		return corruptf("data file envelope field \"circuits\" is not valid JSON")
+	}
+	return nil
+}
+
+// skipValueWithDupKeys consumes one JSON value positioned at its first token,
+// recursively rejecting duplicate object keys.
+func skipValueWithDupKeys(dec *json.Decoder, what string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return corruptf("%s is not valid JSON: %v", what, err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil // scalar (including null)
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]bool)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return corruptf("%s is not valid JSON: %v", what, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return corruptf("%s is not valid JSON", what)
+			}
+			if seen[key] {
+				return corruptf("%s contains duplicate field %q", what, key)
+			}
+			seen[key] = true
+			if err := skipValueWithDupKeys(dec, what+" "+strconv.Quote(key)); err != nil {
+				return err
+			}
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+			return corruptf("%s is not valid JSON", what)
+		}
+	case '[':
+		index := 0
+		for dec.More() {
+			index++
+			if err := skipValueWithDupKeys(dec, fmt.Sprintf("%s element #%d", what, index)); err != nil {
+				return err
+			}
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
+			return corruptf("%s is not valid JSON", what)
+		}
+	}
+	return nil
 }
 
 type persistTerm struct {
@@ -77,6 +293,164 @@ type persistCircuit struct {
 	Frozen        bool               `json:"frozen"`
 	Description   string             `json:"description"`
 	Definition    *persistDefinition `json:"definition,omitempty"`
+}
+
+// Strict decoding of committed circuit records.
+//
+// A circuit record in data.json must name each of name, version, constraints,
+// public_inputs, private_inputs, frozen and description exactly once, with
+// the exact JSON type the writer emits (string / integer / integer / integer
+// / integer / boolean / string). A missing key, a null, a wrong type or a
+// repeated key is data corruption and refuses the whole directory read: a
+// missing or null frozen flag must not silently read as false (turning a
+// frozen version back into an editable draft), and a repeated key must not
+// resolve to its last value. An explicit 0, false or "" is an ordinary value
+// and stays legal. The definition member remains the one optional field: it
+// may be absent or null (the legacy counts-only state); when present it goes
+// through the strict persistDefinition decoder.
+//
+// Only shape is judged here. The domain rules (non-blank name, positive
+// version and constraint count, non-negative input counts) keep being
+// re-checked by validateEnvelope.
+
+var persistCircuitFields = []string{
+	"name", "version", "constraints", "public_inputs", "private_inputs",
+	"frozen", "description", "definition",
+}
+
+func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
+	const what = "stored circuit record"
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("%s must be a JSON object, not null", what)
+	}
+	members, err := strictCircuitObject(raw, what)
+	if err != nil {
+		return err
+	}
+
+	var out persistCircuit
+
+	requireString := func(key string, dst *string) error {
+		r, err := requireMember(members, key, what)
+		if err != nil {
+			return asCorrupt(err)
+		}
+		v, err := decodeJSONString(r, what+" field "+strconv.Quote(key))
+		if err != nil {
+			return asCorrupt(err)
+		}
+		*dst = v
+		return nil
+	}
+	requireInt := func(key string, dst *int) error {
+		r, err := requireMember(members, key, what)
+		if err != nil {
+			return asCorrupt(err)
+		}
+		v, err := decodeJSONInt(r, what+" field "+strconv.Quote(key))
+		if err != nil {
+			return asCorrupt(err)
+		}
+		*dst = v
+		return nil
+	}
+
+	if err := requireString("name", &out.Name); err != nil {
+		return err
+	}
+	if err := requireInt("version", &out.Version); err != nil {
+		return err
+	}
+	if err := requireInt("constraints", &out.Constraints); err != nil {
+		return err
+	}
+	if err := requireInt("public_inputs", &out.PublicInputs); err != nil {
+		return err
+	}
+	if err := requireInt("private_inputs", &out.PrivateInputs); err != nil {
+		return err
+	}
+	frozenRaw, err := requireMember(members, "frozen", what)
+	if err != nil {
+		return asCorrupt(err)
+	}
+	out.Frozen, err = decodeJSONBool(frozenRaw, what+" field "+strconv.Quote("frozen"))
+	if err != nil {
+		return asCorrupt(err)
+	}
+	if err := requireString("description", &out.Description); err != nil {
+		return err
+	}
+
+	// definition is the only optional member: absent or null both mean the
+	// counts-only legacy state.
+	if defRaw, present := members["definition"]; present {
+		if string(bytes.TrimSpace(defRaw)) != "null" {
+			var def persistDefinition
+			if err := json.Unmarshal(defRaw, &def); err != nil {
+				var se StoreError
+				if errors.As(err, &se) {
+					return err // already reported as data corruption
+				}
+				return corruptf("%s field %s is not a valid constraint definition: %v", what, strconv.Quote("definition"), err)
+			}
+			out.Definition = &def
+		}
+	}
+
+	*c = out
+	return nil
+}
+
+// strictCircuitObject decodes one committed circuit record's own member map,
+// demanding a JSON object with exactly the known top-level fields once. It
+// scans only the record's own level: the envelope scanner already attributes a
+// duplicated top-level key to this record, and nested values such as the
+// constraint definition own their (more precise) strict decoders.
+func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, corruptf("%s must be a JSON object", what)
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	open, err := dec.Token()
+	if err != nil || open != json.Delim('{') {
+		return nil, corruptf("%s must be a JSON object", what)
+	}
+	allowed := make(map[string]bool, len(persistCircuitFields))
+	for _, f := range persistCircuitFields {
+		allowed[f] = true
+	}
+	members := make(map[string]json.RawMessage)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, corruptf("%s is not valid JSON: %v", what, err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, corruptf("%s is not valid JSON", what)
+		}
+		if !allowed[key] {
+			return nil, corruptf("%s has unknown field %q", what, key)
+		}
+		if _, repeated := members[key]; repeated {
+			return nil, corruptf("%s contains duplicate field %q", what, key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, corruptf("%s is not valid JSON: %v", what, err)
+		}
+		members[key] = value
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+		return nil, corruptf("%s is not valid JSON", what)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, corruptf("%s is not valid JSON: trailing data after the object", what)
+	}
+	return members, nil
 }
 
 type persistSetup struct {
