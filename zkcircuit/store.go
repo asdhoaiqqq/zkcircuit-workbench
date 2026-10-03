@@ -318,6 +318,11 @@ var persistCircuitFields = []string{
 	"frozen", "description", "definition",
 }
 
+// storedRecordShape is the shared strict-JSON rule set (definition_schema.go)
+// tagged for committed data: every structural failure in a stored circuit
+// record is data corruption, never a bad request.
+var storedRecordShape = jsonShape{fail: corruptf}
+
 func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	const what = "stored circuit record"
 	if string(bytes.TrimSpace(raw)) == "null" {
@@ -331,25 +336,25 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	var out persistCircuit
 
 	requireString := func(key string, dst *string) error {
-		r, err := requireMember(members, key, what)
+		r, err := storedRecordShape.require(members, key, what)
 		if err != nil {
-			return asCorrupt(err)
+			return err
 		}
-		v, err := decodeJSONString(r, what+" field "+strconv.Quote(key))
+		v, err := storedRecordShape.string(r, what+" field "+strconv.Quote(key))
 		if err != nil {
-			return asCorrupt(err)
+			return err
 		}
 		*dst = v
 		return nil
 	}
 	requireInt := func(key string, dst *int) error {
-		r, err := requireMember(members, key, what)
+		r, err := storedRecordShape.require(members, key, what)
 		if err != nil {
-			return asCorrupt(err)
+			return err
 		}
-		v, err := decodeJSONInt(r, what+" field "+strconv.Quote(key))
+		v, err := storedRecordShape.int(r, what+" field "+strconv.Quote(key))
 		if err != nil {
-			return asCorrupt(err)
+			return err
 		}
 		*dst = v
 		return nil
@@ -370,13 +375,13 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	if err := requireInt("private_inputs", &out.PrivateInputs); err != nil {
 		return err
 	}
-	frozenRaw, err := requireMember(members, "frozen", what)
+	frozenRaw, err := storedRecordShape.require(members, "frozen", what)
 	if err != nil {
-		return asCorrupt(err)
+		return err
 	}
-	out.Frozen, err = decodeJSONBool(frozenRaw, what+" field "+strconv.Quote("frozen"))
+	out.Frozen, err = storedRecordShape.bool(frozenRaw, what+" field "+strconv.Quote("frozen"))
 	if err != nil {
-		return asCorrupt(err)
+		return err
 	}
 	if err := requireString("description", &out.Description); err != nil {
 		return err

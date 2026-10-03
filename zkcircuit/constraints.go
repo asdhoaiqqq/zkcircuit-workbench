@@ -141,143 +141,20 @@ func (d *canonicalDefinition) toExport() Definition {
 	return Definition{Modulus: fmt.Sprintf("%d", d.modulus), Constraints: cons}
 }
 
-// ---- strict JSON helpers --------------------------------------------------
-
-// strictObject decodes raw as a JSON object whose keys must all be allowed,
-// rejecting syntax errors, trailing data, duplicates, non-objects and
-// unknown keys. It returns the raw members for typed decoding.
-func strictObject(raw []byte, allowed []string, what string) (map[string]json.RawMessage, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, invalidf("%s must be a JSON object", what)
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &members); err != nil {
-		// Unmarshal also rejects trailing data after the top-level value.
-		return nil, invalidf("%s is not valid JSON: %v", what, err)
-	}
-	allowedSet := make(map[string]bool, len(allowed))
-	for _, k := range allowed {
-		allowedSet[k] = true
-	}
-	for key := range members {
-		if !allowedSet[key] {
-			return nil, invalidf("%s has unknown field %q", what, key)
-		}
-	}
-	if err := rejectDuplicateKeys(trimmed, what); err != nil {
-		return nil, err
-	}
-	return members, nil
-}
-
-// rejectDuplicateKeys walks the JSON token stream rejecting any object that
-// names the same key twice; encoding/json silently keeps the last value.
-func rejectDuplicateKeys(raw []byte, what string) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var walk func() error
-	walk = func() error {
-		tok, err := dec.Token()
-		if err != nil {
-			return invalidf("%s is not valid JSON: %v", what, err)
-		}
-		delim, ok := tok.(json.Delim)
-		if !ok {
-			return nil // scalar
-		}
-		switch delim {
-		case '{':
-			seen := make(map[string]bool)
-			for dec.More() {
-				keyTok, err := dec.Token()
-				if err != nil {
-					return invalidf("%s is not valid JSON: %v", what, err)
-				}
-				key := keyTok.(string)
-				if seen[key] {
-					return invalidf("%s contains duplicate field %q", what, key)
-				}
-				seen[key] = true
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			if _, err := dec.Token(); err != nil { // closing brace
-				return invalidf("%s is not valid JSON: %v", what, err)
-			}
-		case '[':
-			for dec.More() {
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			if _, err := dec.Token(); err != nil { // closing bracket
-				return invalidf("%s is not valid JSON: %v", what, err)
-			}
-		}
-		return nil
-	}
-	return walk()
-}
-
-func requireMember(members map[string]json.RawMessage, key, what string) (json.RawMessage, error) {
-	raw, ok := members[key]
-	if !ok {
-		return nil, invalidf("%s is missing required field %q", what, key)
-	}
-	return raw, nil
-}
-
-// decodeJSONString requires raw to be a JSON string and returns it.
-func decodeJSONString(raw json.RawMessage, what string) (string, error) {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return "", invalidf("%s must be a JSON string, not null", what)
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", invalidf("%s must be a JSON string: %v", what, err)
-	}
-	return s, nil
-}
-
-// decodeJSONBool requires raw to be a JSON boolean (true/false; not null,
-// a number or a string).
-func decodeJSONBool(raw json.RawMessage, what string) (bool, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if string(trimmed) == "true" {
-		return true, nil
-	}
-	if string(trimmed) == "false" {
-		return false, nil
-	}
-	if string(trimmed) == "null" || len(trimmed) == 0 {
-		return false, invalidf("%s must be a JSON boolean, not null", what)
-	}
-	return false, invalidf("%s must be a JSON boolean", what)
-}
-
-// decodeJSONInt requires raw to be a JSON integer (no floats, strings,
-// null).
-func decodeJSONInt(raw json.RawMessage, what string) (int, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if string(trimmed) == "null" || len(trimmed) == 0 {
-		return 0, invalidf("%s must be a JSON integer, not null", what)
-	}
-	if trimmed[0] != '-' && (trimmed[0] < '0' || trimmed[0] > '9') {
-		return 0, invalidf("%s must be a JSON integer", what)
-	}
-	var n int
-	if err := json.Unmarshal(raw, &n); err != nil {
-		return 0, invalidf("%s must be a JSON integer: %v", what, err)
-	}
-	return n, nil
-}
-
 // ---- definition parsing ---------------------------------------------------
+//
+// The structural half of parsing — the three-level definition/constraint/
+// term shape with its required fields, types and duplicate rejection — is
+// the shared schema in definition_schema.go, used verbatim by both the
+// import path here and the committed-data read path. The semantic half is
+// the shared canonicalize below.
 
 // parseDefinitionJSON parses and fully validates a definition document
-// against the version's declared counts.
+// against the version's declared counts. The structural rules (object
+// shapes, required fields, types, duplicates) are the shared schema in
+// definition_schema.go — the same rules the store applies when re-reading a
+// committed definition — tagged here as ErrInvalidArgument because the
+// document comes from a user request.
 //
 // Rejected inputs include malformed JSON, trailing data, duplicate/unknown
 // or missing fields (top level, per constraint and per term), a non-prime or
@@ -286,73 +163,60 @@ func decodeJSONInt(raw json.RawMessage, what string) (int, error) {
 // circuit version's declared count. The wire layout is wire 0 = constant 1,
 // followed by the declared public inputs and then the private inputs.
 func parseDefinitionJSON(raw []byte, public, private, wantCount int) (*canonicalDefinition, error) {
-	members, err := strictObject(raw, []string{"modulus", "constraints"}, "constraint definition")
+	shape, err := decodeDefinitionShape(raw, importDefinitionSource)
 	if err != nil {
 		return nil, err
 	}
-	modulusRaw, err := requireMember(members, "modulus", "constraint definition")
+	return shape.canonicalize(public, private, wantCount)
+}
+
+// canonicalize applies the domain rules to a structurally decoded
+// definition and returns the canonical form: terms merged per wire,
+// coefficients reduced modulo p, zeros dropped, wires sorted ascending
+// within each linear combination. The modulus must be a prime in
+// [2, maxModulus], the constraint count must equal the version's declared
+// count, every coefficient must be a signed decimal integer and every wire
+// must lie inside the declared public/private input layout. Both definition
+// sources run through this same pipeline: the importer on the user's JSON
+// document, the store on the shape re-decoded from committed data.
+func (s definitionShape) canonicalize(public, private, wantCount int) (*canonicalDefinition, error) {
+	p, err := parseModulus(s.modulus)
 	if err != nil {
 		return nil, err
 	}
-	constraintsRaw, err := requireMember(members, "constraints", "constraint definition")
-	if err != nil {
-		return nil, err
-	}
-	modulusText, err := decodeJSONString(modulusRaw, "modulus")
-	if err != nil {
-		return nil, err
-	}
-	p, err := parseModulus(modulusText)
-	if err != nil {
-		return nil, err
-	}
-	if string(bytes.TrimSpace(constraintsRaw)) == "null" {
-		return nil, invalidf("constraint definition field \"constraints\" must be an array")
-	}
-	var constraintRaws []json.RawMessage
-	if err := json.Unmarshal(constraintsRaw, &constraintRaws); err != nil {
-		return nil, invalidf("constraint definition field \"constraints\" must be an array: %v", err)
-	}
-	if len(constraintRaws) != wantCount {
+	if len(s.constraints) != wantCount {
 		return nil, invalidf("constraint count mismatch: definition has %d constraints, version declares %d",
-			len(constraintRaws), wantCount)
+			len(s.constraints), wantCount)
 	}
 
 	parsed := &canonicalDefinition{
 		modulus:     p,
 		public:      public,
 		private:     private,
-		constraints: make([]canonicalConstraint, 0, len(constraintRaws)),
+		constraints: make([]canonicalConstraint, 0, len(s.constraints)),
 	}
 	maxIndex := public + private
-	for i, craw := range constraintRaws {
-		con, err := parseConstraint(craw, p, maxIndex)
+	for i, con := range s.constraints {
+		canonical, err := con.canonicalize(p, maxIndex)
 		if err != nil {
 			return nil, fmt.Errorf("constraint #%d: %w", i+1, err)
 		}
-		parsed.constraints = append(parsed.constraints, con)
+		parsed.constraints = append(parsed.constraints, canonical)
 	}
 	return parsed, nil
 }
 
-// parseConstraint parses one {"a":[…],"b":[…],"c":[…]} object.
-func parseConstraint(raw json.RawMessage, p int64, maxIndex int) (canonicalConstraint, error) {
-	members, err := strictObject(raw, []string{"a", "b", "c"}, "constraint")
-	if err != nil {
-		return canonicalConstraint{}, err
-	}
+// canonicalize reduces one constraint's three sides to canonical form.
+func (c constraintShape) canonicalize(p int64, maxIndex int) (canonicalConstraint, error) {
 	var out canonicalConstraint
 	for _, side := range []struct {
-		key string
-		dst *[]parsedTerm
+		key   string
+		terms []termShape
+		dst   *[]parsedTerm
 	}{
-		{"a", &out.a}, {"b", &out.b}, {"c", &out.c},
+		{"a", c.a, &out.a}, {"b", c.b, &out.b}, {"c", c.c, &out.c},
 	} {
-		sideRaw, err := requireMember(members, side.key, "constraint")
-		if err != nil {
-			return canonicalConstraint{}, err
-		}
-		terms, err := parseLinearCombo(sideRaw, p, maxIndex, side.key)
+		terms, err := canonicalizeTerms(side.terms, p, maxIndex, side.key)
 		if err != nil {
 			return canonicalConstraint{}, err
 		}
@@ -361,53 +225,26 @@ func parseConstraint(raw json.RawMessage, p int64, maxIndex int) (canonicalConst
 	return out, nil
 }
 
-// parseLinearCombo parses an array of {"wire":int,"coeff":string} terms and
-// returns the canonical combination: duplicate wires merged, coefficients
-// reduced modulo p, zeros dropped, wires sorted ascending.
-func parseLinearCombo(raw json.RawMessage, p int64, maxIndex int, side string) ([]parsedTerm, error) {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return nil, invalidf("constraint side %q must be an array", side)
-	}
-	var termRaws []json.RawMessage
-	if err := json.Unmarshal(raw, &termRaws); err != nil {
-		return nil, invalidf("constraint side %q must be an array: %v", side, err)
-	}
+// canonicalizeTerms validates one side's terms and returns the canonical
+// combination: duplicate wires merged, coefficients reduced modulo p, zeros
+// dropped, wires sorted ascending.
+func canonicalizeTerms(terms []termShape, p int64, maxIndex int, side string) ([]parsedTerm, error) {
 	bigP := big.NewInt(p)
 	merged := make(map[int]*big.Int)
-	for j, traw := range termRaws {
-		members, err := strictObject(traw, []string{"wire", "coeff"}, fmt.Sprintf("term %s[%d]", side, j))
-		if err != nil {
-			return nil, err
+	for j, t := range terms {
+		if t.wire < 0 || t.wire > maxIndex {
+			return nil, invalidf("term %s[%d] references wire %d outside [0,%d]", side, j, t.wire, maxIndex)
 		}
-		wireRaw, err := requireMember(members, "wire", fmt.Sprintf("term %s[%d]", side, j))
+		coeff, err := parseBigSignedDecimal(t.coeff)
 		if err != nil {
-			return nil, err
-		}
-		coeffRaw, err := requireMember(members, "coeff", fmt.Sprintf("term %s[%d]", side, j))
-		if err != nil {
-			return nil, err
-		}
-		wire, err := decodeJSONInt(wireRaw, fmt.Sprintf("term %s[%d] wire", side, j))
-		if err != nil {
-			return nil, err
-		}
-		if wire < 0 || wire > maxIndex {
-			return nil, invalidf("term %s[%d] references wire %d outside [0,%d]", side, j, wire, maxIndex)
-		}
-		coeffText, err := decodeJSONString(coeffRaw, fmt.Sprintf("term %s[%d] coefficient", side, j))
-		if err != nil {
-			return nil, err
-		}
-		coeff, err := parseBigSignedDecimal(coeffText)
-		if err != nil {
-			return nil, invalidf("term %s[%d] coefficient %q is not a decimal integer: %v", side, j, coeffText, err)
+			return nil, invalidf("term %s[%d] coefficient %q is not a decimal integer: %v", side, j, t.coeff, err)
 		}
 		coeff.Mod(coeff, bigP) // into [0,p); Go's Mod keeps the sign of p
-		if existing, ok := merged[wire]; ok {
+		if existing, ok := merged[t.wire]; ok {
 			existing.Add(existing, coeff)
 			existing.Mod(existing, bigP)
 		} else {
-			merged[wire] = new(big.Int).Set(coeff)
+			merged[t.wire] = new(big.Int).Set(coeff)
 		}
 	}
 	out := make([]parsedTerm, 0, len(merged))
@@ -628,169 +465,13 @@ func (d *canonicalDefinition) toPersist() persistDefinition {
 
 // definitionFromPersist re-validates a stored definition against its
 // version's declared input counts and rebuilds its canonical form. It is
-// used both at load time (integrity check) and before compile/check.
+// used both at load time (integrity check) and before compile/check. The
+// stored shape was already checked against the shared structural schema when
+// the data file was decoded (persistDefinition.UnmarshalJSON), so what
+// remains is the shared semantic pipeline every definition also runs at
+// import time.
 func definitionFromPersist(p persistDefinition, public, private int) (*canonicalDefinition, error) {
-	combo := func(tt []persistTerm) []Term {
-		r := make([]Term, 0, len(tt))
-		for _, t := range tt {
-			r = append(r, Term{Wire: t.Wire, Coeff: t.Coeff})
-		}
-		return r
-	}
-	cons := make([]Constraint, 0, len(p.Constraints))
-	for _, c := range p.Constraints {
-		cons = append(cons, Constraint{A: combo(c.A), B: combo(c.B), C: combo(c.C)})
-	}
-	raw, err := json.Marshal(Definition{Modulus: p.Modulus, Constraints: cons})
-	if err != nil {
-		return nil, err
-	}
-	return parseDefinitionJSON(raw, public, private, len(cons))
-}
-
-// ---- strict decoding of persisted definitions -----------------------------
-//
-// The persist shapes below are part of the committed data file rather than an
-// import request, so their UnmarshalJSON methods demand the exact shape the
-// importer writes and tag every shape failure as data corruption. This runs
-// while the envelope is being read, before validateEnvelope: a definition that
-// omits a side array or a term's wire/coeff — which a plain struct decode
-// would silently turn into a nil slice or a zero int/string — is refused at
-// read time instead of being mistaken for an empty array, wire 0 or an empty
-// coefficient. Null in place of one of these fields, a null element inside an
-// array, a non-object term and an unknown/duplicate member are refused the
-// same way.
-//
-// An explicitly empty side array still decodes to the zero linear combination
-// and an explicit wire:0 still names the constant wire; both are ordinary
-// values and stay legal. The circuit record's definition pointer itself may
-// be absent or null: encoding/json leaves the pointer nil without invoking
-// these methods, which is exactly the legacy counts-only state.
-//
-// These decoders enforce shape only. The semantic rules (prime modulus,
-// wire range, constraint count) are re-checked by validateEnvelope through
-// the same definitionFromPersist pipeline used after a clean import.
-
-// asCorrupt retags a structural decode failure as data corruption. The
-// strict-JSON helpers describe shape problems with ErrInvalidArgument, the
-// right kind for a rejected import request but not for damage discovered in
-// already-committed data.
-func asCorrupt(err error) error {
-	if err == nil {
-		return nil
-	}
-	var se StoreError
-	if errors.As(err, &se) {
-		return StoreError{Kind: ErrDataCorrupt.Kind, Detail: se.Detail}
-	}
-	return corruptf("%v", err)
-}
-
-func (p *persistDefinition) UnmarshalJSON(raw []byte) error {
-	members, err := strictObject(raw, []string{"modulus", "constraints"}, "stored constraint definition")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	modulusRaw, err := requireMember(members, "modulus", "stored constraint definition")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	constraintsRaw, err := requireMember(members, "constraints", "stored constraint definition")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	modulusText, err := decodeJSONString(modulusRaw, "stored modulus")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	if string(bytes.TrimSpace(constraintsRaw)) == "null" {
-		return corruptf("stored constraint definition field \"constraints\" must be an array, not null")
-	}
-	var constraints []persistConstraint
-	if err := json.Unmarshal(constraintsRaw, &constraints); err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return err // already reported as data corruption by an inner decoder
-		}
-		return corruptf("stored constraint definition field \"constraints\" must be an array: %v", err)
-	}
-	*p = persistDefinition{Modulus: modulusText, Constraints: constraints}
-	return nil
-}
-
-func (c *persistConstraint) UnmarshalJSON(raw []byte) error {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return corruptf("stored constraint must be a JSON object, not null")
-	}
-	members, err := strictObject(raw, []string{"a", "b", "c"}, "stored constraint")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	var out persistConstraint
-	for _, side := range []struct {
-		key string
-		dst *[]persistTerm
-	}{
-		{"a", &out.A}, {"b", &out.B}, {"c", &out.C},
-	} {
-		sideRaw, err := requireMember(members, side.key, "stored constraint")
-		if err != nil {
-			return asCorrupt(err)
-		}
-		terms, err := decodePersistTerms(sideRaw, side.key)
-		if err != nil {
-			return err
-		}
-		*side.dst = terms
-	}
-	*c = out
-	return nil
-}
-
-// decodePersistTerms decodes one a/b/c array, rejecting null and any element
-// that is not a well-formed term object.
-func decodePersistTerms(raw json.RawMessage, side string) ([]persistTerm, error) {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return nil, corruptf("stored constraint side %q must be an array, not null", side)
-	}
-	var terms []persistTerm
-	if err := json.Unmarshal(raw, &terms); err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return nil, err // a null/malformed element already reported corruption
-		}
-		return nil, corruptf("stored constraint side %q must be an array: %v", side, err)
-	}
-	return terms, nil
-}
-
-func (t *persistTerm) UnmarshalJSON(raw []byte) error {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return corruptf("stored term must be a JSON object, not null")
-	}
-	members, err := strictObject(raw, []string{"wire", "coeff"}, "stored term")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	wireRaw, err := requireMember(members, "wire", "stored term")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	coeffRaw, err := requireMember(members, "coeff", "stored term")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	wire, err := decodeJSONInt(wireRaw, "stored term wire")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	coeff, err := decodeJSONString(coeffRaw, "stored term coefficient")
-	if err != nil {
-		return asCorrupt(err)
-	}
-	t.Wire = wire
-	t.Coeff = coeff
-	return nil
+	return shapeFromPersist(p).canonicalize(public, private, len(p.Constraints))
 }
 
 // ---- input checking -------------------------------------------------------
