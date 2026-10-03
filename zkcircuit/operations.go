@@ -68,23 +68,10 @@ func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 		if existing.Frozen {
 			return false, frozenf("circuit %q version %d is frozen and its description cannot be modified", c.Name, c.Version)
 		}
-		// When a definition is already imported, changing the three counts is
-		// only accepted as a whole if the definition stays legal under them
-		// (exact constraint count, all wires inside the new input layout).
-		if existing.Definition != nil {
-			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
-			if perr != nil {
-				return false, corruptf("stored definition for %q v%d is unreadable: %v", c.Name, c.Version, perr)
-			}
-			if !parsed.compatibleWith(c.Constraints, c.PublicInputs, c.PrivateInputs) {
-				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
-			}
+		if err := checkUpdateKeepsDefinitionLegal(existing, c.Constraints, c.PublicInputs, c.PrivateInputs); err != nil {
+			return false, err
 		}
-		existing.Constraints = c.Constraints
-		existing.PublicInputs = c.PublicInputs
-		existing.PrivateInputs = c.PrivateInputs
-		existing.Description = c.Description
-		result = circuitFromPersist(*existing)
+		result = commitCircuitUpdate(existing, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Description)
 		return true, nil
 	})
 	return result, err
@@ -147,17 +134,8 @@ func (s *Store) UpdateCircuitPartial(name string, version int, patch PartialCirc
 		if err := validateCounts(merged.Constraints, merged.PublicInputs, merged.PrivateInputs); err != nil {
 			return false, err
 		}
-		// When a definition is already imported, the merged counts must keep
-		// it legal (exact constraint count, all wires inside the new input
-		// layout). The definition itself is never touched here.
-		if existing.Definition != nil {
-			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
-			if perr != nil {
-				return false, corruptf("stored definition for %q v%d is unreadable: %v", name, version, perr)
-			}
-			if !parsed.compatibleWith(merged.Constraints, merged.PublicInputs, merged.PrivateInputs) {
-				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
-			}
+		if err := checkUpdateKeepsDefinitionLegal(existing, merged.Constraints, merged.PublicInputs, merged.PrivateInputs); err != nil {
+			return false, err
 		}
 		// No modifiable field was provided: return the stored record without
 		// committing anything.
@@ -165,11 +143,7 @@ func (s *Store) UpdateCircuitPartial(name string, version int, patch PartialCirc
 			result = circuitFromPersist(*existing)
 			return false, nil
 		}
-		existing.Constraints = merged.Constraints
-		existing.PublicInputs = merged.PublicInputs
-		existing.PrivateInputs = merged.PrivateInputs
-		existing.Description = merged.Description
-		result = circuitFromPersist(*existing)
+		result = commitCircuitUpdate(existing, merged.Constraints, merged.PublicInputs, merged.PrivateInputs, merged.Description)
 		return true, nil
 	})
 	return result, err
@@ -495,6 +469,45 @@ func validateCounts(constraints, publicInputs, privateInputs int) error {
 		return invalidf("private input count must not be negative, got %d", privateInputs)
 	}
 	return nil
+}
+
+// --- update helpers ---------------------------------------------------------
+
+// checkUpdateKeepsDefinitionLegal guards a draft update (full replacement or
+// merged patch) against the version's imported constraint definition: when a
+// definition is present, the new counts are only accepted as a whole if the
+// definition stays legal under them — the constraint count must match exactly
+// and every referenced wire must lie inside the new input layout. Versions
+// without a definition accept any counts. The check is pure: it never
+// modifies the record, and the definition itself is never replaced by an
+// update. A stored definition that cannot be parsed is reported as
+// corruption.
+func checkUpdateKeepsDefinitionLegal(existing *persistCircuit, constraints, publicInputs, privateInputs int) error {
+	if existing.Definition == nil {
+		return nil
+	}
+	parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
+	if perr != nil {
+		return corruptf("stored definition for %q v%d is unreadable: %v", existing.Name, existing.Version, perr)
+	}
+	if !parsed.compatibleWith(constraints, publicInputs, privateInputs) {
+		return invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
+	}
+	return nil
+}
+
+// commitCircuitUpdate applies an already-validated update to a draft record:
+// the three counts and the description are replaced as one atomic change and
+// the updated public record is returned. Name, version, the frozen flag and
+// any imported constraint definition stay untouched. Callers must run
+// validateCounts and checkUpdateKeepsDefinitionLegal first; a rejected update
+// must never reach this commit.
+func commitCircuitUpdate(existing *persistCircuit, constraints, publicInputs, privateInputs int, description string) Circuit {
+	existing.Constraints = constraints
+	existing.PublicInputs = publicInputs
+	existing.PrivateInputs = privateInputs
+	existing.Description = description
+	return circuitFromPersist(*existing)
 }
 
 // --- lookup / mapping helpers --------------------------------------------
