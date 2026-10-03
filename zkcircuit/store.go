@@ -1,6 +1,7 @@
 package zkcircuit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,117 @@ type persistCircuit struct {
 	Frozen        bool               `json:"frozen"`
 	Description   string             `json:"description"`
 	Definition    *persistDefinition `json:"definition,omitempty"`
+}
+
+// circuitRecordFields is the exact member set of a stored circuit record:
+// the seven required scalar fields plus the optional constraint definition.
+var circuitRecordFields = []string{
+	"name", "version", "constraints", "public_inputs", "private_inputs",
+	"frozen", "description", "definition",
+}
+
+// UnmarshalJSON decodes a stored circuit record strictly. Like the persisted
+// definition decoders, this record is committed data rather than an import
+// request, so every scalar field must be present exactly once with its
+// declared JSON type: name and description strings, version and the three
+// counts integers, frozen a boolean. A missing, null, mistyped or duplicated
+// field is reported as data corruption — never silently read as the zero
+// value, because a dropped "frozen" would otherwise unfreeze the version and
+// a dropped count would silently change its declared layout. Duplicates are
+// rejected even when both values agree, and a key reached through JSON
+// escapes ("frosen") still names the same field. Explicit zero input
+// counts, frozen:false and the empty description are ordinary values and
+// decode normally. The definition member stays optional: absent or null is
+// the legacy counts-only state.
+func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
+	const what = "stored circuit record"
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("%s must be a JSON object, not null", what)
+	}
+	members, err := strictObject(raw, circuitRecordFields, what)
+	if err != nil {
+		return asCorrupt(err)
+	}
+	field := func(key string) string {
+		return fmt.Sprintf("%s field %q", what, key)
+	}
+	stringMember := func(key string) (string, error) {
+		raw, err := requireMember(members, key, what)
+		if err != nil {
+			return "", asCorrupt(err)
+		}
+		s, err := decodeJSONString(raw, field(key))
+		if err != nil {
+			return "", asCorrupt(err)
+		}
+		return s, nil
+	}
+	intMember := func(key string) (int, error) {
+		raw, err := requireMember(members, key, what)
+		if err != nil {
+			return 0, asCorrupt(err)
+		}
+		n, err := decodeJSONInt(raw, field(key))
+		if err != nil {
+			return 0, asCorrupt(err)
+		}
+		return n, nil
+	}
+
+	name, err := stringMember("name")
+	if err != nil {
+		return err
+	}
+	version, err := intMember("version")
+	if err != nil {
+		return err
+	}
+	constraints, err := intMember("constraints")
+	if err != nil {
+		return err
+	}
+	publicInputs, err := intMember("public_inputs")
+	if err != nil {
+		return err
+	}
+	privateInputs, err := intMember("private_inputs")
+	if err != nil {
+		return err
+	}
+	frozenRaw, err := requireMember(members, "frozen", what)
+	if err != nil {
+		return asCorrupt(err)
+	}
+	frozen, err := decodeJSONBool(frozenRaw, field("frozen"))
+	if err != nil {
+		return asCorrupt(err)
+	}
+	description, err := stringMember("description")
+	if err != nil {
+		return err
+	}
+
+	// Absent or null definition is the counts-only state; anything else must
+	// be a well-formed stored definition (its own decoder tags corruption).
+	var def *persistDefinition
+	if defRaw, ok := members["definition"]; ok && string(bytes.TrimSpace(defRaw)) != "null" {
+		var d persistDefinition
+		if err := json.Unmarshal(defRaw, &d); err != nil {
+			var se StoreError
+			if errors.As(err, &se) {
+				return err // already reported as data corruption
+			}
+			return corruptf("%s field %q is not a valid constraint definition: %v", what, "definition", err)
+		}
+		def = &d
+	}
+
+	*c = persistCircuit{
+		Name: name, Version: version, Constraints: constraints,
+		PublicInputs: publicInputs, PrivateInputs: privateInputs,
+		Frozen: frozen, Description: description, Definition: def,
+	}
+	return nil
 }
 
 type persistSetup struct {
