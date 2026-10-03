@@ -51,11 +51,26 @@ func (s *Store) CreateCircuit(c Circuit) (Circuit, error) {
 // unfrozen version explicitly: unknown versions yield ErrNotFound and frozen
 // versions yield ErrFrozen. On success the counts and description are
 // replaced as one atomic change; partial updates can never be observed.
+//
+// This is the whole-record replacement entry point: the three counts and the
+// description carried by c override the stored record outright (zero values
+// included). Field-by-field editing with omitted-field preservation lives in
+// UpdateCircuitPartial; both entry points run the same draft-update rules
+// through the circuitMutation helpers below.
 func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 	if err := validateCircuitKey(c.Name, c.Version); err != nil {
 		return Circuit{}, err
 	}
-	if err := validateCounts(c.Constraints, c.PublicInputs, c.PrivateInputs); err != nil {
+	mutation := circuitMutation{
+		Constraints:   c.Constraints,
+		PublicInputs:  c.PublicInputs,
+		PrivateInputs: c.PrivateInputs,
+		Description:   c.Description,
+	}
+	// Whole replacement judges the supplied counts before the target is
+	// looked up, so an illegal replacement reports invalid argument even for
+	// unknown or frozen versions.
+	if err := validateMutationCounts(mutation); err != nil {
 		return Circuit{}, err
 	}
 
@@ -68,23 +83,10 @@ func (s *Store) UpdateCircuit(c Circuit) (Circuit, error) {
 		if existing.Frozen {
 			return false, frozenf("circuit %q version %d is frozen and its description cannot be modified", c.Name, c.Version)
 		}
-		// When a definition is already imported, changing the three counts is
-		// only accepted as a whole if the definition stays legal under them
-		// (exact constraint count, all wires inside the new input layout).
-		if existing.Definition != nil {
-			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
-			if perr != nil {
-				return false, corruptf("stored definition for %q v%d is unreadable: %v", c.Name, c.Version, perr)
-			}
-			if !parsed.compatibleWith(c.Constraints, c.PublicInputs, c.PrivateInputs) {
-				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
-			}
+		if err := validateMutationDefinition(*existing, mutation); err != nil {
+			return false, err
 		}
-		existing.Constraints = c.Constraints
-		existing.PublicInputs = c.PublicInputs
-		existing.PrivateInputs = c.PrivateInputs
-		existing.Description = c.Description
-		result = circuitFromPersist(*existing)
+		result = applyCircuitMutation(existing, mutation)
 		return true, nil
 	})
 	return result, err
@@ -104,21 +106,28 @@ type PartialCircuit struct {
 // UpdateCircuitPartial modifies selected fields of a draft circuit version.
 //
 // Only fields present in patch are changed; omitted fields keep their stored
-// values. The whole merged result is validated before anything is committed:
-// constraints must stay positive and input counts non-negative, and when a
-// constraint definition is already imported the merged counts must keep it
-// legal (exact constraint count, every referenced wire inside the new input
-// layout). Any rejected field refuses the entire change — description,
-// counts and the stored definition all remain as they were.
+// values. A non-nil pointer still replaces its field even when it points at
+// zero or the empty string (explicit zero clears an input count, an empty
+// string clears the description). The whole merged result is validated
+// before anything is committed: constraints must stay positive and input
+// counts non-negative, and when a constraint definition is already imported
+// the merged counts must keep it legal (exact constraint count, every
+// referenced wire inside the new input layout). Any rejected field refuses
+// the entire change — description, counts and the stored definition all
+// remain as they were. The merged result is checked through the same
+// circuitMutation helpers as UpdateCircuit's whole replacement.
 //
-// Unknown versions yield ErrNotFound and frozen versions ErrFrozen even when
-// no field is being changed. A patch that provides no modifiable field at
-// all returns the stored record unchanged and commits nothing (no new
-// version, no data write).
+// Existence and frozen state are settled before the merged counts are
+// judged: unknown versions yield ErrNotFound and frozen versions
+// ErrFrozen, even when the patch carries an illegal count or no field at
+// all. A patch that provides no modifiable field at all returns the stored
+// record unchanged and commits nothing (no new version, no data write).
 func (s *Store) UpdateCircuitPartial(name string, version int, patch PartialCircuit) (Circuit, error) {
 	if err := validateCircuitKey(name, version); err != nil {
 		return Circuit{}, err
 	}
+	hasField := patch.Constraints != nil || patch.PublicInputs != nil ||
+		patch.PrivateInputs != nil || patch.Description != nil
 
 	var result Circuit
 	err := s.withLock(func() (bool, error) {
@@ -130,49 +139,99 @@ func (s *Store) UpdateCircuitPartial(name string, version int, patch PartialCirc
 			return false, frozenf("circuit %q version %d is frozen and cannot be modified", name, version)
 		}
 		// Merge the provided fields over the stored record; omitted fields
-		// keep their committed values.
-		merged := *existing
+		// keep their committed values, so the merged counts are always the
+		// complete result this modification would leave behind.
+		mutation := circuitMutation{
+			Constraints:   existing.Constraints,
+			PublicInputs:  existing.PublicInputs,
+			PrivateInputs: existing.PrivateInputs,
+			Description:   existing.Description,
+		}
 		if patch.Constraints != nil {
-			merged.Constraints = *patch.Constraints
+			mutation.Constraints = *patch.Constraints
 		}
 		if patch.PublicInputs != nil {
-			merged.PublicInputs = *patch.PublicInputs
+			mutation.PublicInputs = *patch.PublicInputs
 		}
 		if patch.PrivateInputs != nil {
-			merged.PrivateInputs = *patch.PrivateInputs
+			mutation.PrivateInputs = *patch.PrivateInputs
 		}
 		if patch.Description != nil {
-			merged.Description = *patch.Description
+			mutation.Description = *patch.Description
 		}
-		if err := validateCounts(merged.Constraints, merged.PublicInputs, merged.PrivateInputs); err != nil {
+		if err := validateMutationCounts(mutation); err != nil {
 			return false, err
 		}
-		// When a definition is already imported, the merged counts must keep
-		// it legal (exact constraint count, all wires inside the new input
-		// layout). The definition itself is never touched here.
-		if existing.Definition != nil {
-			parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
-			if perr != nil {
-				return false, corruptf("stored definition for %q v%d is unreadable: %v", name, version, perr)
-			}
-			if !parsed.compatibleWith(merged.Constraints, merged.PublicInputs, merged.PrivateInputs) {
-				return false, invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
-			}
+		if err := validateMutationDefinition(*existing, mutation); err != nil {
+			return false, err
 		}
 		// No modifiable field was provided: return the stored record without
 		// committing anything.
-		if patch.Constraints == nil && patch.PublicInputs == nil && patch.PrivateInputs == nil && patch.Description == nil {
+		if !hasField {
 			result = circuitFromPersist(*existing)
 			return false, nil
 		}
-		existing.Constraints = merged.Constraints
-		existing.PublicInputs = merged.PublicInputs
-		existing.PrivateInputs = merged.PrivateInputs
-		existing.Description = merged.Description
-		result = circuitFromPersist(*existing)
+		result = applyCircuitMutation(existing, mutation)
 		return true, nil
 	})
 	return result, err
+}
+
+// --- draft update internals -----------------------------------------------
+//
+// circuitMutation is the complete set of updatable draft fields one
+// modification would leave committed: the three counts and the description.
+// Both public update entry points resolve their request into this type —
+// UpdateCircuit takes all four values from the request, UpdateCircuitPartial
+// merges request fields over the stored record — and then share the same
+// count rules, imported-definition compatibility check and commit, so the
+// two usages can never drift apart. A mutation never replaces the stored
+// constraint definition; it is only checked against it.
+type circuitMutation struct {
+	Constraints   int
+	PublicInputs  int
+	PrivateInputs int
+	Description   string
+}
+
+// validateMutationCounts holds the basic count rules for any draft update:
+// constraints must be greater than zero and both input counts must not be
+// negative. The rules are judged on the mutation's complete resulting
+// counts, not on the supplied fields alone.
+func validateMutationCounts(m circuitMutation) error {
+	return validateCounts(m.Constraints, m.PublicInputs, m.PrivateInputs)
+}
+
+// validateMutationDefinition holds the rule shared with imported
+// definitions: when the version already has one, the mutation's complete
+// resulting counts must keep it legal — exactly as many constraints as the
+// definition and every referenced wire inside the resulting public/private
+// input layout. An unreadable stored definition is reported as data
+// corruption. A version without a definition imposes no extra rule.
+func validateMutationDefinition(existing persistCircuit, m circuitMutation) error {
+	if existing.Definition == nil {
+		return nil
+	}
+	parsed, perr := definitionFromPersist(*existing.Definition, existing.PublicInputs, existing.PrivateInputs)
+	if perr != nil {
+		return corruptf("stored definition for %q v%d is unreadable: %v", existing.Name, existing.Version, perr)
+	}
+	if !parsed.compatibleWith(m.Constraints, m.PublicInputs, m.PrivateInputs) {
+		return invalidf("update rejected: it would make the imported constraint definition illegal (constraint count or wire layout mismatch); the whole change is refused")
+	}
+	return nil
+}
+
+// applyCircuitMutation commits a validated mutation onto the stored draft
+// record, overwriting the three counts and the description together. The
+// name, version, frozen flag and imported definition are never touched. The
+// caller is responsible for all validation and for holding the store lock.
+func applyCircuitMutation(existing *persistCircuit, m circuitMutation) Circuit {
+	existing.Constraints = m.Constraints
+	existing.PublicInputs = m.PublicInputs
+	existing.PrivateInputs = m.PrivateInputs
+	existing.Description = m.Description
+	return circuitFromPersist(*existing)
 }
 
 // FreezeCircuit freezes a circuit version. Unknown versions yield
