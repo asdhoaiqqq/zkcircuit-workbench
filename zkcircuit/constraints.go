@@ -632,6 +632,151 @@ func definitionFromPersist(p persistDefinition, public, private int) (*canonical
 	return parseDefinitionJSON(raw, public, private, len(cons))
 }
 
+// ---- strict decoding of persisted definitions -----------------------------
+//
+// The persist shapes below are part of the committed data file rather than an
+// import request, so their UnmarshalJSON methods demand the exact shape the
+// importer writes and tag every shape failure as data corruption. This runs
+// while the envelope is being read, before validateEnvelope: a definition that
+// omits a side array or a term's wire/coeff — which a plain struct decode
+// would silently turn into a nil slice or a zero int/string — is refused at
+// read time instead of being mistaken for an empty array, wire 0 or an empty
+// coefficient. Null in place of one of these fields, a null element inside an
+// array, a non-object term and an unknown/duplicate member are refused the
+// same way.
+//
+// An explicitly empty side array still decodes to the zero linear combination
+// and an explicit wire:0 still names the constant wire; both are ordinary
+// values and stay legal. The circuit record's definition pointer itself may
+// be absent or null: encoding/json leaves the pointer nil without invoking
+// these methods, which is exactly the legacy counts-only state.
+//
+// These decoders enforce shape only. The semantic rules (prime modulus,
+// wire range, constraint count) are re-checked by validateEnvelope through
+// the same definitionFromPersist pipeline used after a clean import.
+
+// asCorrupt retags a structural decode failure as data corruption. The
+// strict-JSON helpers describe shape problems with ErrInvalidArgument, the
+// right kind for a rejected import request but not for damage discovered in
+// already-committed data.
+func asCorrupt(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se StoreError
+	if errors.As(err, &se) {
+		return StoreError{Kind: ErrDataCorrupt.Kind, Detail: se.Detail}
+	}
+	return corruptf("%v", err)
+}
+
+func (p *persistDefinition) UnmarshalJSON(raw []byte) error {
+	members, err := strictObject(raw, []string{"modulus", "constraints"}, "stored constraint definition")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	modulusRaw, err := requireMember(members, "modulus", "stored constraint definition")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	constraintsRaw, err := requireMember(members, "constraints", "stored constraint definition")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	modulusText, err := decodeJSONString(modulusRaw, "stored modulus")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	if string(bytes.TrimSpace(constraintsRaw)) == "null" {
+		return corruptf("stored constraint definition field \"constraints\" must be an array, not null")
+	}
+	var constraints []persistConstraint
+	if err := json.Unmarshal(constraintsRaw, &constraints); err != nil {
+		var se StoreError
+		if errors.As(err, &se) {
+			return err // already reported as data corruption by an inner decoder
+		}
+		return corruptf("stored constraint definition field \"constraints\" must be an array: %v", err)
+	}
+	*p = persistDefinition{Modulus: modulusText, Constraints: constraints}
+	return nil
+}
+
+func (c *persistConstraint) UnmarshalJSON(raw []byte) error {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("stored constraint must be a JSON object, not null")
+	}
+	members, err := strictObject(raw, []string{"a", "b", "c"}, "stored constraint")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	var out persistConstraint
+	for _, side := range []struct {
+		key string
+		dst *[]persistTerm
+	}{
+		{"a", &out.A}, {"b", &out.B}, {"c", &out.C},
+	} {
+		sideRaw, err := requireMember(members, side.key, "stored constraint")
+		if err != nil {
+			return asCorrupt(err)
+		}
+		terms, err := decodePersistTerms(sideRaw, side.key)
+		if err != nil {
+			return err
+		}
+		*side.dst = terms
+	}
+	*c = out
+	return nil
+}
+
+// decodePersistTerms decodes one a/b/c array, rejecting null and any element
+// that is not a well-formed term object.
+func decodePersistTerms(raw json.RawMessage, side string) ([]persistTerm, error) {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil, corruptf("stored constraint side %q must be an array, not null", side)
+	}
+	var terms []persistTerm
+	if err := json.Unmarshal(raw, &terms); err != nil {
+		var se StoreError
+		if errors.As(err, &se) {
+			return nil, err // a null/malformed element already reported corruption
+		}
+		return nil, corruptf("stored constraint side %q must be an array: %v", side, err)
+	}
+	return terms, nil
+}
+
+func (t *persistTerm) UnmarshalJSON(raw []byte) error {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("stored term must be a JSON object, not null")
+	}
+	members, err := strictObject(raw, []string{"wire", "coeff"}, "stored term")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	wireRaw, err := requireMember(members, "wire", "stored term")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	coeffRaw, err := requireMember(members, "coeff", "stored term")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	wire, err := decodeJSONInt(wireRaw, "stored term wire")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	coeff, err := decodeJSONString(coeffRaw, "stored term coefficient")
+	if err != nil {
+		return asCorrupt(err)
+	}
+	t.Wire = wire
+	t.Coeff = coeff
+	return nil
+}
+
 // ---- input checking -------------------------------------------------------
 
 // parseWitness validates the check input JSON and tags every rejection as an

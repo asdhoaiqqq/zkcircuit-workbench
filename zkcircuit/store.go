@@ -190,6 +190,13 @@ func (s *Store) loadLocked() error {
 
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
+		// Shape failures surfaced by the persisted-definition decoders are
+		// integrity failures, not JSON syntax errors; report their detail
+		// instead of the generic "not valid JSON" wording.
+		var se StoreError
+		if errors.As(err, &se) && se.Kind == ErrDataCorrupt.Kind {
+			return corruptf("data file %q failed integrity validation: %s; original file left in place", s.dataPath(), se.Detail)
+		}
 		return corruptf("data file %q is not valid JSON (%v); original file left in place", s.dataPath(), err)
 	}
 	if env.Format == 0 {
