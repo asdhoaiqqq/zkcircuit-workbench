@@ -47,13 +47,14 @@ type envelope struct {
 	Artifacts []persistArtifact `json:"artifacts,omitempty"`
 }
 
-// envelopeWire is the decoding-only shape: circuit records arrive raw so
-// their own strict decoder can require every field explicitly.
+// envelopeWire is the decoding-only shape: circuit and job records arrive raw
+// so their own strict decoders can require every field explicitly and reject a
+// malformed compiled_hash binding rather than silently reading it as unbound.
 type envelopeWire struct {
 	Format    int               `json:"format"`
 	Circuits  []json.RawMessage `json:"circuits"`
 	Setups    []persistSetup    `json:"setups"`
-	Jobs      []persistJob      `json:"jobs"`
+	Jobs      []json.RawMessage `json:"jobs"`
 	Artifacts []persistArtifact `json:"artifacts,omitempty"`
 }
 
@@ -75,7 +76,6 @@ func (e *envelope) UnmarshalJSON(raw []byte) error {
 	}
 	e.Format = wire.Format
 	e.Setups = wire.Setups
-	e.Jobs = wire.Jobs
 	e.Artifacts = wire.Artifacts
 	if wire.Circuits == nil {
 		e.Circuits = nil
@@ -95,6 +95,25 @@ func (e *envelope) UnmarshalJSON(raw []byte) error {
 			return corruptf("circuit record #%d: %v", i+1, err)
 		}
 		e.Circuits[i] = record
+	}
+	if wire.Jobs == nil {
+		e.Jobs = nil
+	} else {
+		e.Jobs = make([]persistJob, len(wire.Jobs))
+	}
+	for i, jraw := range wire.Jobs {
+		var record persistJob
+		if err := json.Unmarshal(jraw, &record); err != nil {
+			var se StoreError
+			if errors.As(err, &se) {
+				// Carry the record index and the job id the decoder found so a
+				// damaged binding is attributed to the job it belongs to.
+				return StoreError{Kind: ErrDataCorrupt.Kind,
+					Detail: fmt.Sprintf("job record #%d: %s", i+1, se.Detail)}
+			}
+			return corruptf("job record #%d: %v", i+1, err)
+		}
+		e.Jobs[i] = record
 	}
 	return nil
 }
@@ -129,6 +148,12 @@ func scanEnvelopeDuplicates(raw []byte) error {
 		seenTop[key] = true
 		if key == "circuits" {
 			if err := scanCircuitArrayDuplicates(dec); err != nil {
+				return err
+			}
+			continue
+		}
+		if key == "jobs" {
+			if err := scanJobArrayDuplicates(dec); err != nil {
 				return err
 			}
 			continue
@@ -203,6 +228,83 @@ func scanCircuitArrayDuplicates(dec *json.Decoder) error {
 		return corruptf("data file envelope field \"circuits\" is not valid JSON")
 	}
 	return nil
+}
+
+// scanJobArrayDuplicates consumes one "jobs" value positioned at its opening
+// bracket and checks each job record's own top-level keys, attributing a
+// repeated key to the record (1-based) and its id when the id has been read.
+// A null array stays the pre-existing "no records" reading. Nested values are
+// skipped: the job record carries only scalars, and its strict decoder owns
+// the value-level shape checks.
+func scanJobArrayDuplicates(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return corruptf("data file envelope field \"jobs\" is not valid JSON: %v", err)
+	}
+	if tok == nil { // null: json.Unmarshal would produce no records
+		return nil
+	}
+	if tok != json.Delim('[') {
+		return corruptf("data file envelope field \"jobs\" must be an array")
+	}
+	index := 0
+	for dec.More() {
+		index++
+		open, err := dec.Token()
+		if err != nil {
+			return corruptf("job record #%d is not valid JSON: %v", index, err)
+		}
+		if open == nil {
+			return corruptf("job record #%d must be a JSON object, not null", index)
+		}
+		if open != json.Delim('{') {
+			return corruptf("job record #%d must be a JSON object", index)
+		}
+		seen := make(map[string]bool)
+		id := ""
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return corruptf("job record #%d is not valid JSON: %v", index, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return corruptf("job record #%d is not valid JSON", index)
+			}
+			// Best-effort attribution: capture the id string when it precedes
+			// the offending key; a non-string id is a shape error the strict
+			// decoder reports on its own.
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				return corruptf("job record #%d is not valid JSON: %v", index, err)
+			}
+			if key == "id" && id == "" {
+				_ = json.Unmarshal(bytes.TrimSpace(value), &id)
+			}
+			if seen[key] {
+				return jobCorruptf(index, id, "contains duplicate field %q", key)
+			}
+			seen[key] = true
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+			return corruptf("job record #%d is not valid JSON", index)
+		}
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
+		return corruptf("data file envelope field \"jobs\" is not valid JSON")
+	}
+	return nil
+}
+
+// jobCorruptf reports a structural problem with one committed job record,
+// naming its index and, when known, its id so a damaged compiled_hash binding
+// can be traced to the job it belongs to.
+func jobCorruptf(index int, id string, format string, args ...any) error {
+	detail := fmt.Sprintf(format, args...)
+	if id != "" {
+		return corruptf("job record #%d (id %q) %s", index, id, detail)
+	}
+	return corruptf("job record #%d %s", index, detail)
 }
 
 // skipValueWithDupKeys consumes one JSON value positioned at its first token,
@@ -471,8 +573,81 @@ type persistJob struct {
 	Attempt  int    `json:"attempt"`
 	Artifact string `json:"artifact,omitempty"`
 	// CompiledHash is the optional binding to the pinned version's compiled
-	// artifact, stored exactly as submitted.
+	// artifact, stored exactly as submitted. It may be omitted (legacy
+	// register-only records) or be an explicit JSON string, including "". A
+	// present value of any other JSON type is corruption and is refused by
+	// UnmarshalJSON rather than read as the empty (unbound) string.
 	CompiledHash string `json:"compiled_hash,omitempty"`
+}
+
+// jobWire mirrors persistJob for decoding the scalar members. Presence of the
+// optional compiled_hash is detected separately through a member map, because
+// decoding JSON null into *json.RawMessage leaves the pointer nil and would
+// make a present null indistinguishable from an omitted field.
+type jobWire struct {
+	ID       string `json:"id"`
+	Circuit  string `json:"circuit"`
+	Version  int    `json:"version"`
+	Kind     string `json:"kind"`
+	Attempt  int    `json:"attempt"`
+	Artifact string `json:"artifact"`
+}
+
+// Strict decoding of the committed compiled-artifact binding.
+//
+// This deliberately judges only compiled_hash. The field is optional so
+// register-only records written before bindings existed keep loading, and an
+// explicit JSON "" keeps meaning "unbound". But once the member appears it
+// must be a JSON string: null must not silently decode to the empty string
+// (which would display a submitted binding as an unbound job), and a number,
+// boolean, array or object is rejected the same way. Repeated members are
+// rejected earlier, during the envelope duplicate scan, so the last value can
+// never win. The job id is named when readable so the damaged binding can be
+// traced to its record.
+func (j *persistJob) UnmarshalJSON(raw []byte) error {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("stored job record must be a JSON object, not null")
+	}
+	var wire jobWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return corruptf("stored job record is not valid JSON: %v", err)
+	}
+	// Member map preserves the raw bytes of a present compiled_hash, null
+	// included; a top-level repeated key never reaches here because the
+	// envelope scanner rejects it before this decoder runs.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return corruptf("stored job record is not valid JSON: %v", err)
+	}
+
+	out := persistJob{
+		ID: wire.ID, Circuit: wire.Circuit, Version: wire.Version,
+		Kind: wire.Kind, Attempt: wire.Attempt, Artifact: wire.Artifact,
+	}
+	if field, present := members["compiled_hash"]; present {
+		trimmed := bytes.TrimSpace(field)
+		if string(trimmed) == "null" {
+			return jobFieldCorruptf(wire.ID, "compiled_hash",
+				"must be a JSON string, not null (a saved binding must not be read as unbound)")
+		}
+		var hash string
+		if err := json.Unmarshal(trimmed, &hash); err != nil {
+			return jobFieldCorruptf(wire.ID, "compiled_hash",
+				"must be a JSON string, got a non-string JSON value")
+		}
+		out.CompiledHash = hash
+	}
+	*j = out
+	return nil
+}
+
+// jobFieldCorruptf names a damaged field of one committed job, using the job
+// id when it decoded; the envelope decoder adds the record index around it.
+func jobFieldCorruptf(id, field, detail string) error {
+	if id != "" {
+		return corruptf("job %q field %q %s", id, field, detail)
+	}
+	return corruptf("job field %q %s", field, detail)
 }
 
 // Store is a persistent workbench backed by one local data directory.
