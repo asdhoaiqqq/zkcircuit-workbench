@@ -408,11 +408,20 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 }
 
 // strictCircuitObject decodes one committed circuit record's own member map,
-// demanding a JSON object with exactly the known top-level fields once. It
-// scans only the record's own level: the envelope scanner already attributes a
-// duplicated top-level key to this record, and nested values such as the
-// constraint definition own their (more precise) strict decoders.
+// demanding a JSON object with exactly the known top-level fields once.
 func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, error) {
+	return strictObjectMembers(raw, what, persistCircuitFields)
+}
+
+// strictObjectMembers decodes one committed record's own member map,
+// demanding a JSON object without repeated keys. A non-nil allowed list
+// restricts which keys may appear; nil allows any key. It scans only the
+// record's own level: the envelope scanner already attributes a duplicated
+// top-level key to this record, and nested values such as the constraint
+// definition own their (more precise) strict decoders. Keys are compared
+// after JSON unescaping, so a field repeated through a \uXXXX spelling is
+// still a duplicate, even when both values are identical.
+func strictObjectMembers(raw []byte, what string, allowedFields []string) (map[string]json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, corruptf("%s must be a JSON object", what)
@@ -423,9 +432,12 @@ func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, e
 	if err != nil || open != json.Delim('{') {
 		return nil, corruptf("%s must be a JSON object", what)
 	}
-	allowed := make(map[string]bool, len(persistCircuitFields))
-	for _, f := range persistCircuitFields {
-		allowed[f] = true
+	var allowed map[string]bool
+	if allowedFields != nil {
+		allowed = make(map[string]bool, len(allowedFields))
+		for _, f := range allowedFields {
+			allowed[f] = true
+		}
 	}
 	members := make(map[string]json.RawMessage)
 	for dec.More() {
@@ -437,7 +449,7 @@ func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, e
 		if !ok {
 			return nil, corruptf("%s is not valid JSON", what)
 		}
-		if !allowed[key] {
+		if allowed != nil && !allowed[key] {
 			return nil, corruptf("%s has unknown field %q", what, key)
 		}
 		if _, repeated := members[key]; repeated {
@@ -473,6 +485,61 @@ type persistJob struct {
 	// CompiledHash is the optional binding to the pinned version's compiled
 	// artifact, stored exactly as submitted.
 	CompiledHash string `json:"compiled_hash,omitempty"`
+}
+
+// Strict decoding of the compiled-artifact binding on a committed job record.
+//
+// compiled_hash is a field whose presence is meaningful: records written
+// before bindings existed simply omit it, and an explicit "" is the unbound
+// state. But once the key appears its value must be a JSON string. A null is
+// not "no binding" — it is damage to a binding the record claims to carry,
+// and so is a number, boolean, array or object in its place. Reading either
+// as the zero string would silently turn a bound job into an unbound one
+// (and the next commit would drop the field entirely), so the read is
+// refused as data corruption instead. A repeated key — including one
+// repeated through JSON string escapes, even with identical values — is
+// likewise refused rather than resolved to its last value. A legal non-empty
+// string keeps being matched against the pinned version's artifact by
+// validateEnvelope, exactly as written.
+//
+// Only the binding field is judged here; every other field keeps the
+// ordinary struct decoding.
+func (j *persistJob) UnmarshalJSON(raw []byte) error {
+	const what = "stored job record"
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return corruptf("%s must be a JSON object, not null", what)
+	}
+	members, err := strictObjectMembers(raw, what, nil)
+	if err != nil {
+		return err
+	}
+	// Name the job in a binding-field failure when its id is legible; the id
+	// itself is decoded for real by the ordinary pass below.
+	where := what
+	if idRaw, ok := members["id"]; ok {
+		if id, idErr := storedRecordShape.string(idRaw, what+` field "id"`); idErr == nil {
+			where = fmt.Sprintf("stored job record %q", id)
+		}
+	}
+	compiledHash := ""
+	hasBinding := false
+	if hashRaw, present := members["compiled_hash"]; present {
+		hash, err := storedRecordShape.string(hashRaw, where+` field "compiled_hash"`)
+		if err != nil {
+			return err
+		}
+		compiledHash, hasBinding = hash, true
+	}
+	type plainJob persistJob
+	var decoded plainJob
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return corruptf("%s is not valid JSON: %v", what, err)
+	}
+	if hasBinding {
+		decoded.CompiledHash = compiledHash
+	}
+	*j = persistJob(decoded)
+	return nil
 }
 
 // Store is a persistent workbench backed by one local data directory.
