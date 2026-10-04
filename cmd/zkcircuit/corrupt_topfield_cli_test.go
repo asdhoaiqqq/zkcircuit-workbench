@@ -283,3 +283,117 @@ func TestCLISingleCaseVariantTopFieldsReadNormally(t *testing.T) {
 		t.Fatalf("artifact binding lost across canonicalization: code=%d out=%q", r.code, r.out)
 	}
 }
+
+// TestCLINonASCIILookalikeTopFieldExitCode drives top-level keys that
+// encoding/json's Unicode case folding would read as a known field —
+// "circuitſ" with U+017F long s, written directly or as the JSON escape
+// ſ — through the CLI. Alone or beside the canonical key, in either
+// order, with a full, empty or null value, every data command must exit 3,
+// print nothing on stdout, name the canonical field and the actual
+// spelling, and leave data.json byte-for-byte in place.
+func TestCLINonASCIILookalikeTopFieldExitCode(t *testing.T) {
+	escCircuits := `"circuitſ"` // decodes to "circuitſ"
+	cases := []struct {
+		name      string
+		member    string // raw "key":value text of the extra member
+		canonical string
+		alias     string // decoded lookalike spelling the error must name
+		before    bool   // extra member precedes the canonical one
+	}{
+		{"circuits then circuitſ empty", `"circuitſ":[]`, "circuits", "circuitſ", false},
+		{"circuitſ empty then circuits", `"circuitſ":[]`, "circuits", "circuitſ", true},
+		{"circuits then escaped circuitſ", escCircuits + `:[]`, "circuits", "circuitſ", false},
+		{"circuitſ null then circuits", `"circuitſ":null`, "circuits", "circuitſ", true},
+		{"setups then setupſ empty", `"setupſ":[]`, "setups", "setupſ", false},
+		{"jobſ empty then jobs", `"jobſ":[]`, "jobs", "jobſ", true},
+		{"artifacts then artifactſ null", `"artifactſ":null`, "artifacts", "artifactſ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "bench")
+			seedBoundJobCLI(t, dir)
+			compact := compactDataFile(t, dir)
+			bad := appendTopLevelMember(t, compact, tc.member, tc.before)
+			bad = append(bad, '\n')
+			path := filepath.Join(dir, "data.json")
+			if err := os.WriteFile(path, bad, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			commands := [][]string{
+				{"circuit-list", "--dir", dir},
+				{"circuit-get", "--dir", dir, "--name", "mul", "--version", "1"},
+				{"job-list", "--dir", dir},
+				{"job-get", "--dir", dir, "--id", "j1"},
+				// Mutating commands must refuse before committing.
+				{"circuit-create", "--dir", dir, "--name", "new", "--version", "2",
+					"--constraints", "1", "--description", "d"},
+				{"circuit-freeze", "--dir", dir, "--name", "mul", "--version", "1"},
+			}
+			for _, args := range commands {
+				r := callCLI(t, args...)
+				if r.code != 3 {
+					t.Fatalf("%s: want exit 3, got %d (out=%q err=%q)", args[0], r.code, r.out, r.err)
+				}
+				if r.out != "" {
+					t.Fatalf("%s printed success output despite corruption: %q", args[0], r.out)
+				}
+				if !strings.Contains(r.err, "read failed") || !strings.Contains(r.err, "data corrupt") {
+					t.Fatalf("%s: unexpected error text %q", args[0], r.err)
+				}
+				if !strings.Contains(r.err, strconv.Quote(tc.canonical)) ||
+					!strings.Contains(r.err, strconv.Quote(tc.alias)) {
+					t.Fatalf("%s: error does not name field %q and spelling %q: %q",
+						args[0], tc.canonical, tc.alias, r.err)
+				}
+			}
+
+			left, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(left) != string(bad) {
+				t.Fatalf("data.json changed after refused commands")
+			}
+		})
+	}
+}
+
+// TestCLINonASCIILookalikeSoleSpelling: the lookalike key appears with no
+// correctly spelled sibling at all — the canonical "circuits" member is
+// renamed to "circuitſ" outright. The directory must still be unreadable:
+// the lookalike can never stand in for the real field.
+func TestCLINonASCIILookalikeSoleSpelling(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bench")
+	seedBoundJobCLI(t, dir)
+	compact := compactDataFile(t, dir)
+	renamed := rewriteTopLevelKeys(t, compact, map[string]string{
+		"circuits": `"circuitſ"`,
+	})
+	bad := append(renamed, '\n')
+	if err := os.WriteFile(filepath.Join(dir, "data.json"), bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"circuit-list", "--dir", dir},
+		{"job-list", "--dir", dir},
+		{"circuit-create", "--dir", dir, "--name", "new", "--version", "2",
+			"--constraints", "1", "--description", "d"},
+	} {
+		r := callCLI(t, args...)
+		if r.code != 3 || r.out != "" {
+			t.Fatalf("%s: want exit 3 with no output, got code=%d out=%q err=%q",
+				args[0], r.code, r.out, r.err)
+		}
+		if !strings.Contains(r.err, `"circuits"`) || !strings.Contains(r.err, `"circuitſ"`) {
+			t.Fatalf("%s: error does not name the field and its lookalike: %q", args[0], r.err)
+		}
+	}
+	left, err := os.ReadFile(filepath.Join(dir, "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(left) != string(bad) {
+		t.Fatalf("data.json changed after refused commands")
+	}
+}

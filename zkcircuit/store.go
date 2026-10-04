@@ -42,7 +42,12 @@ const (
 // the envelope's top level that comparison is case-insensitive for the five
 // known fields (format/circuits/setups/jobs/artifacts): a second spelling
 // that differs only in ASCII letter case — including one JSON-escaped — names
-// the same field and corrupts the read instead of overriding it.
+// the same field and corrupts the read instead of overriding it. A non-ASCII
+// spelling that encoding/json's Unicode case folding would still match onto
+// one of those fields ("circuitſ" with U+017F long s) is likewise corruption
+// rather than an unknown member to skip: left alone it would be read as the
+// real field, and a null or empty value under it would silently drop the
+// committed records on the next commit.
 type envelope struct {
 	Format    int               `json:"format"`
 	Circuits  []persistCircuit  `json:"circuits"`
@@ -137,6 +142,28 @@ func canonicalEnvelopeField(key string) string {
 	return ""
 }
 
+// envelopeFieldLookalike reports the standard lowercase name of a known
+// envelope field when key is not an accepted ASCII spelling of it
+// (canonicalEnvelopeField) yet encoding/json's struct-tag matching would
+// still fold key onto that field. Struct-tag matching uses the Unicode
+// simple case-folding rules (strings.EqualFold), under which a non-ASCII
+// lookalike — "circuitſ" with U+017F long s, "ſetups", "artifactſ", whether
+// written directly or as the JSON escape u017f — names the field just like
+// the canonical spelling and would silently fill (or, with a null or empty
+// value, silently empty) the corresponding slice. Such a key is damage to
+// the envelope, never an unknown member to ignore. Genuinely unknown keys
+// that no fold maps to a known field — "note", "CIRCUIT", or "cİrcuits"
+// with U+0130 dotted capital I, which simple folding does not equate with
+// "i" — return "" and keep the pre-existing unknown-member handling.
+func envelopeFieldLookalike(key string) string {
+	for _, field := range envelopeTopFields {
+		if strings.EqualFold(key, field) {
+			return field
+		}
+	}
+	return ""
+}
+
 // scanEnvelopeDuplicates tokenizes the committed envelope and rejects every
 // repeated object key. The five known top-level fields are identified case-
 // insensitively: two spellings that differ only in ASCII letter case (both
@@ -145,6 +172,16 @@ func canonicalEnvelopeField(key string) string {
 // "CIRCUITS" or "FORMAT" can never override an earlier one through encoding/
 // json's last-value-wins struct matching. Such a pair is reported as a
 // duplicated top-level field named by its standard lowercase spelling.
+//
+// A single non-ASCII spelling that encoding/json's Unicode-folded tag
+// matching would resolve to a known field — "circuitſ" with U+017F long s,
+// written directly or as the JSON escape u017f — is rejected on its own,
+// whatever value it carries (legal records, an empty array or null) and
+// whether or not a standard or ASCII case-variant spelling of the same field
+// also appears, in either order: the fold would let it silently stand in for
+// the real field, so the whole directory is corrupt. Only genuinely unknown
+// keys (no fold reaches a known field, e.g. "note" or "cİrcuits" with
+// U+0130) keep the pre-existing unknown-member handling.
 //
 // Circuit records are scanned one level deep only — their top-level fields
 // are checked here (with the record's 1-based index reported), while values
@@ -192,6 +229,17 @@ func scanEnvelopeDuplicates(raw []byte) error {
 				return err
 			}
 			continue
+		}
+		// A non-ASCII spelling that encoding/json's Unicode-folded tag
+		// matching would silently read as one of the five known fields
+		// ("circuitſ" with long s, directly written or ſ-escaped) is
+		// damage, whatever its value and whether or not a correctly spelled
+		// sibling key is present: it must never be ignored as an unknown
+		// member, which would let it empty or override the real field and
+		// drop the existing records on the next commit.
+		if folded := envelopeFieldLookalike(key); folded != "" {
+			return corruptf("data file envelope carries top-level field %q under non-ASCII spelling %q; such a lookalike spelling is data corruption",
+				folded, key)
 		}
 		if seenTop[key] {
 			return corruptf("data file envelope contains duplicate field %q", key)

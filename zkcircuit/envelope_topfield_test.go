@@ -629,3 +629,204 @@ func TestCaseVariantDirectoryCommitCanonicalizes(t *testing.T) {
 		t.Fatalf("binding lost across canonicalization: %+v %v", j, err)
 	}
 }
+
+// These tests pin the non-ASCII lookalike rule for the top-level envelope
+// fields: encoding/json matches struct tags with Unicode case folding, under
+// which U+017F (long s) equals "s", so a key like "circuitſ" — written
+// directly or as the JSON escape ſ — would be read as "circuits" even
+// though it is not an accepted ASCII spelling. Such a key corrupts the whole
+// directory read: on its own, beside the canonical spelling or an ASCII case
+// variant, in either order, and whatever value it carries (legal records, an
+// empty array or null). Genuinely unknown keys that no fold maps to a known
+// field ("note", "cİrcuits" with U+0130) keep the pre-existing handling.
+
+// lookalikeSpellings returns JSON key tokens naming field with every ASCII
+// "s" replaced by U+017F long s: written directly and with the long s
+// JSON-escaped. Fields without an "s" (format) have no non-ASCII fold alias
+// and are absent from the map.
+func lookalikeSpellings(field string) map[string]string {
+	if !strings.ContainsRune(field, 's') {
+		return nil
+	}
+	direct := strings.ReplaceAll(field, "s", "ſ")
+	escaped := strings.ReplaceAll(strconv.Quote(direct), "ſ", `ſ`)
+	return map[string]string{
+		"direct":  strconv.Quote(direct),
+		"escaped": escaped,
+	}
+}
+
+// requireTopLevelLookalikeCorrupt opens dir, requires a data-corrupt error
+// naming both the canonical field and the actual non-ASCII spelling, and
+// requires data.json to stay byte-for-byte.
+func requireTopLevelLookalikeCorrupt(t *testing.T, dir string, bad []byte, canonical, aliasToken string) {
+	t.Helper()
+	s, err := Open(dir)
+	if err == nil {
+		s.Close()
+		t.Fatalf("non-ASCII lookalike of top-level field %q was accepted", canonical)
+	}
+	var se StoreError
+	if !errors.As(err, &se) || se.Kind != ErrDataCorrupt.Kind {
+		t.Fatalf("want ErrDataCorrupt, got %v", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, strconv.Quote(canonical)) {
+		t.Fatalf("error does not name the canonical field %q: %v", canonical, err)
+	}
+	var alias string
+	if uerr := json.Unmarshal([]byte(aliasToken), &alias); uerr != nil {
+		t.Fatalf("alias token %s does not decode: %v", aliasToken, uerr)
+	}
+	if !strings.Contains(msg, strconv.Quote(alias)) {
+		t.Fatalf("error does not name the lookalike spelling %q: %v", alias, err)
+	}
+	left, rerr := os.ReadFile(filepath.Join(dir, dirDataFile))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(left) != string(bad) {
+		t.Fatalf("refused read modified data.json\nwant: %q\n got: %q", bad, left)
+	}
+	if s2, err := Open(dir); err == nil {
+		s2.Close()
+		t.Fatalf("reopen accepted the lookalike top-level field")
+	} else if !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("reopen: want ErrDataCorrupt, got %v", err)
+	}
+}
+
+// TestTopLevelNonASCIILookalikeRefused is the matrix: every top-level field
+// with a long-s fold alias is corrupted by the lookalike spelling, alone or
+// beside the canonical key, in either order, with the dangerous value shapes
+// (a full value, an empty array, null), under the direct and the escaped
+// spelling alike.
+func TestTopLevelNonASCIILookalikeRefused(t *testing.T) {
+	for _, field := range envelopeTopFields {
+		spellings := lookalikeSpellings(field)
+		if spellings == nil {
+			continue // format: no non-ASCII fold alias exists
+		}
+		for variant, aliasToken := range spellings {
+			values := map[string]json.RawMessage{
+				"alone-full":  nil, // the field's own seeded value
+				"alone-empty": json.RawMessage("[]"),
+				"alone-null":  json.RawMessage("null"),
+			}
+			for vname, aliasVal := range values {
+				t.Run(field+"/"+variant+"/"+vname, func(t *testing.T) {
+					dir, _ := seedBoundStore(t)
+					vals := envelopeValues(readOrderedEnvelope(t, dir))
+					val := aliasVal
+					if val == nil {
+						val = vals[field]
+					}
+					// The lookalike member is appended after the canonical
+					// ones; the canonical field keeps its seeded value.
+					bad := dupEnvelope(t, vals, field, strconv.Quote(field), aliasToken,
+						vals[field], val)
+					writeRawEnvelope(t, dir, bad)
+					requireTopLevelLookalikeCorrupt(t, dir, bad, field, aliasToken)
+				})
+			}
+			// The lookalike precedes every canonical member.
+			t.Run(field+"/"+variant+"/first", func(t *testing.T) {
+				dir, _ := seedBoundStore(t)
+				vals := envelopeValues(readOrderedEnvelope(t, dir))
+				var kvs []envKv
+				kvs = append(kvs, envKv{keyToken: aliasToken, val: json.RawMessage("[]")})
+				for _, f := range envelopeTopFields {
+					val := vals[f]
+					if len(val) == 0 {
+						continue
+					}
+					kvs = append(kvs, envKv{keyToken: strconv.Quote(f), val: val})
+				}
+				bad := writeEnvelope(t, dir, kvs)
+				requireTopLevelLookalikeCorrupt(t, dir, bad, field, aliasToken)
+			})
+			// The lookalike appears with no correctly spelled sibling at all.
+			t.Run(field+"/"+variant+"/sole", func(t *testing.T) {
+				dir, _ := seedBoundStore(t)
+				kvs := readOrderedEnvelope(t, dir)
+				for i := range kvs {
+					var key string
+					if err := json.Unmarshal([]byte(kvs[i].keyToken), &key); err != nil {
+						t.Fatal(err)
+					}
+					if key == field {
+						kvs[i].keyToken = aliasToken
+					}
+				}
+				bad := writeEnvelope(t, dir, kvs)
+				requireTopLevelLookalikeCorrupt(t, dir, bad, field, aliasToken)
+			})
+		}
+	}
+}
+
+// TestTopLevelLookalikeCannotEmptyCommittedRecords pins the headline failure
+// mode: a committed circuit list followed by "circuitſ":[] must not read as
+// an empty list and must not let a later commit drop the existing records.
+func TestTopLevelLookalikeCannotEmptyCommittedRecords(t *testing.T) {
+	dir, _ := seedBoundStore(t)
+	vals := envelopeValues(readOrderedEnvelope(t, dir))
+	bad := dupEnvelope(t, vals, "circuits", `"circuits"`, `"circuitſ"`,
+		vals["circuits"], json.RawMessage("[]"))
+	writeRawEnvelope(t, dir, bad)
+
+	s, err := Open(dir)
+	if !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("want ErrDataCorrupt, got %v", err)
+	}
+	// Even after the refused open, no operation may succeed against the
+	// damaged file and the file itself stays byte-for-byte.
+	if s != nil {
+		t.Fatalf("corrupt directory yielded a store")
+	}
+	left, _ := os.ReadFile(filepath.Join(dir, dirDataFile))
+	if string(left) != string(bad) {
+		t.Fatalf("data.json modified after refused read")
+	}
+}
+
+// TestTopLevelLookalikeDiscoveredAfterOpen: an already-open directory whose
+// file gains a lookalike key must fail closed on the next read and on the
+// next mutation, without serving cached data or committing.
+func TestTopLevelLookalikeDiscoveredAfterOpen(t *testing.T) {
+	dir := seedClosedStore(t, false)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.GetCircuit("mul", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	vals := envelopeValues(readOrderedEnvelope(t, dir))
+	bad := dupEnvelope(t, vals, "circuits", `"circuits"`, `"circuitſ"`,
+		vals["circuits"], json.RawMessage("[]"))
+	writeRawEnvelope(t, dir, bad)
+
+	if _, err := s.ListCircuits(); !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("ListCircuits after tamper: want ErrDataCorrupt, got %v", err)
+	}
+	if _, err := s.GetCircuit("mul", 1); !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("GetCircuit after tamper: want ErrDataCorrupt, got %v", err)
+	}
+	if _, err := s.FreezeCircuit("mul", 1); !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("FreezeCircuit after tamper: want ErrDataCorrupt, got %v", err)
+	}
+	if _, err := s.CreateCircuit(Circuit{Name: "new", Version: 1, Constraints: 1,
+		Description: "d"}); !errors.Is(err, ErrDataCorrupt) {
+		t.Fatalf("CreateCircuit after tamper: want ErrDataCorrupt, got %v", err)
+	}
+	left, err := os.ReadFile(filepath.Join(dir, dirDataFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(left) != string(bad) {
+		t.Fatalf("tampered data.json was overwritten")
+	}
+}
