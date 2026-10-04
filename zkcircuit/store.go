@@ -797,6 +797,15 @@ func validateEnvelope(env envelope) error {
 		if c.PublicInputs < 0 || c.PrivateInputs < 0 {
 			return fmt.Errorf("circuit %q v%d: input counts must not be negative", c.Name, c.Version)
 		}
+		// The same representability rule the write path enforces: wire 0 plus
+		// every declared input must fit inside the platform's int. A record
+		// beyond that bound can never have been written by this build and
+		// cannot be checked safely, so the directory is corrupt rather than
+		// silently narrowed or read with a wrapped-around layout.
+		if !inputLayoutRepresentable(c.PublicInputs, c.PrivateInputs) {
+			return fmt.Errorf("circuit %q v%d: input layout is not representable: 1 constant wire + %d public + %d private inputs exceeds the platform limit of %d wires",
+				c.Name, c.Version, c.PublicInputs, c.PrivateInputs, maxInputWires)
+		}
 		if c.Definition != nil {
 			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
 				return err

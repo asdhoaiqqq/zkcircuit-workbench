@@ -1,6 +1,7 @@
 package zkcircuit
 
 import (
+	"math"
 	"sort"
 	"strings"
 )
@@ -543,6 +544,23 @@ func validateCircuitKey(name string, version int) error {
 	return nil
 }
 
+// maxInputWires is the largest declared input count that stays representable
+// on the running platform. Wire numbering always reserves wire 0 for the
+// constant one, so the wires a version names are 0 plus its public and private
+// inputs: the declared counts must satisfy 1 + public + private <= M, where M
+// is the largest positive value the platform's int can hold. The check is done
+// without ever adding the counts, so a layout whose sum would wrap (e.g.
+// public=M with one private input) is refused rather than accepted through
+// integer wraparound as a small, representable layout.
+const maxInputWires = math.MaxInt
+
+// inputLayoutRepresentable reports whether the constant wire plus the public
+// and private inputs fits inside the platform's int. Callers already guarantee
+// both counts are non-negative.
+func inputLayoutRepresentable(publicInputs, privateInputs int) bool {
+	return publicInputs <= maxInputWires-1 && privateInputs <= maxInputWires-1-publicInputs
+}
+
 func validateCounts(constraints, publicInputs, privateInputs int) error {
 	if constraints <= 0 {
 		return invalidf("constraints must be greater than zero, got %d", constraints)
@@ -552,6 +570,10 @@ func validateCounts(constraints, publicInputs, privateInputs int) error {
 	}
 	if privateInputs < 0 {
 		return invalidf("private input count must not be negative, got %d", privateInputs)
+	}
+	if !inputLayoutRepresentable(publicInputs, privateInputs) {
+		return invalidf("input layout is not representable: 1 constant wire + %d public + %d private inputs exceeds the platform limit of %d wires",
+			publicInputs, privateInputs, maxInputWires)
 	}
 	return nil
 }

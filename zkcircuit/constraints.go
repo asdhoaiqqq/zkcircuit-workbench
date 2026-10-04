@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"math/big"
 	"sort"
 )
@@ -121,7 +122,23 @@ func (d *canonicalDefinition) compatibleWith(constraints, public, private int) b
 	if len(d.constraints) != constraints {
 		return false
 	}
-	return d.maxWire() <= public+private
+	bound, ok := wireUpperBound(public, private)
+	if !ok {
+		return false
+	}
+	return d.maxWire() <= bound
+}
+
+// wireUpperBound returns the highest input-wire index the declared layout
+// names — public + private — reporting ok=false when that sum would wrap the
+// platform's int. Every reachable caller has already passed the layout rule
+// 1 + public + private <= M, so ok=false marks an unrepresentable layout and
+// is never silently treated as a small (possibly negative) bound.
+func wireUpperBound(public, private int) (bound int, ok bool) {
+	if public > math.MaxInt-private {
+		return 0, false
+	}
+	return public + private, true
 }
 
 // toExport renders the canonical form as the public Definition type, with
@@ -195,7 +212,10 @@ func (s definitionShape) canonicalize(public, private, wantCount int) (*canonica
 		private:     private,
 		constraints: make([]canonicalConstraint, 0, len(s.constraints)),
 	}
-	maxIndex := public + private
+	maxIndex, representable := wireUpperBound(public, private)
+	if !representable {
+		return nil, invalidf("input layout is not representable: 1 constant wire plus the declared public and private inputs exceeds the platform wire limit")
+	}
 	for i, con := range s.constraints {
 		canonical, err := con.canonicalize(p, maxIndex)
 		if err != nil {
