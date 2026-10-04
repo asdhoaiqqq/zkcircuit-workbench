@@ -487,6 +487,31 @@ type persistJob struct {
 	CompiledHash string `json:"compiled_hash,omitempty"`
 }
 
+// compiledHashKey is the canonical spelling of a job record's
+// compiled-artifact binding field.
+const compiledHashKey = "compiled_hash"
+
+// isCompiledHashKey reports whether key names the compiled-artifact binding
+// field, allowing differences in ASCII letter case only: "compiled_hash",
+// "COMPILED_HASH" and every mixed-case spelling are the same field. Keys are
+// already JSON-unescaped at this point, so an escaped spelling of any of
+// these forms lands here too. Non-ASCII lookalikes never match.
+func isCompiledHashKey(key string) bool {
+	if len(key) != len(compiledHashKey) {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != compiledHashKey[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Strict decoding of the compiled-artifact binding on a committed job record.
 //
 // compiled_hash is a field whose presence is meaningful: records written
@@ -501,6 +526,13 @@ type persistJob struct {
 // likewise refused rather than resolved to its last value. A legal non-empty
 // string keeps being matched against the pinned version's artifact by
 // validateEnvelope, exactly as written.
+//
+// The field is recognized under any ASCII letter-case spelling, so a record
+// carrying "COMPILED_HASH" (or any mixed-case form, escaped or not) is the
+// same binding and follows the same rules: a single such key is read with
+// the full string validation above, and two spellings of the field on one
+// record — even with byte-identical values — are a duplicate binding and
+// corrupt the read rather than being resolved by key order.
 //
 // Only the binding field is judged here; every other field keeps the
 // ordinary struct decoding.
@@ -521,10 +553,27 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 			where = fmt.Sprintf("stored job record %q", id)
 		}
 	}
+	// Every spelling of the binding field counts as the same one field; the
+	// record may carry it at most once, however it is capitalized.
+	var bindingKeys []string
+	for key := range members {
+		if isCompiledHashKey(key) {
+			bindingKeys = append(bindingKeys, key)
+		}
+	}
+	if len(bindingKeys) > 1 {
+		sort.Strings(bindingKeys)
+		quoted := make([]string, len(bindingKeys))
+		for i, k := range bindingKeys {
+			quoted[i] = strconv.Quote(k)
+		}
+		return corruptf("%s carries the binding field %q more than once (as %s)",
+			where, compiledHashKey, strings.Join(quoted, ", "))
+	}
 	compiledHash := ""
 	hasBinding := false
-	if hashRaw, present := members["compiled_hash"]; present {
-		hash, err := storedRecordShape.string(hashRaw, where+` field "compiled_hash"`)
+	if len(bindingKeys) == 1 {
+		hash, err := storedRecordShape.string(members[bindingKeys[0]], where+` field "compiled_hash"`)
 		if err != nil {
 			return err
 		}
