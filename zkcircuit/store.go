@@ -557,11 +557,11 @@ type persistJob struct {
 // compiled-artifact binding field.
 const compiledHashKey = "compiled_hash"
 
-// isCompiledHashKey reports whether key names the compiled-artifact binding
-// field, allowing differences in ASCII letter case only: "compiled_hash",
-// "COMPILED_HASH" and every mixed-case spelling are the same field. Keys are
+// isCompiledHashKey reports whether key is an accepted spelling of the
+// compiled-artifact binding field: only "compiled_hash" itself and ASCII
+// letter-case variants such as "COMPILED_HASH" or "CoMpIlEd_HaSh". Keys are
 // already JSON-unescaped at this point, so an escaped spelling of any of
-// these forms lands here too. Non-ASCII lookalikes never match.
+// these forms lands here too. Non-ASCII letters are never folded here.
 func isCompiledHashKey(key string) bool {
 	if len(key) != len(compiledHashKey) {
 		return false
@@ -576,6 +576,33 @@ func isCompiledHashKey(key string) bool {
 		}
 	}
 	return true
+}
+
+// compiledHashLookalike reports a member key encoding/json would match onto
+// the binding field's struct tag yet which is not an accepted ASCII spelling
+// (isCompiledHashKey). Struct-tag matching in encoding/json folds with the
+// Unicode simple case-folding rules (bytes.EqualFold), so a non-ASCII
+// lookalike — "compiled_haſh" with U+017F long s, whether written directly
+// or as the JSON escape u017f — silently fills CompiledHash and would let a
+// damaged binding (null above all) read as unbound, then vanish on the next
+// commit. Such a key is damage, regardless of its value or of a correctly
+// spelled sibling key being present. Several aliases are reported in
+// lexicographic order so the message is stable.
+func compiledHashLookalike(members map[string]json.RawMessage) string {
+	var aliases []string
+	for key := range members {
+		if isCompiledHashKey(key) {
+			continue
+		}
+		if strings.EqualFold(key, compiledHashKey) {
+			aliases = append(aliases, key)
+		}
+	}
+	if len(aliases) == 0 {
+		return ""
+	}
+	sort.Strings(aliases)
+	return aliases[0]
 }
 
 // Strict decoding of the compiled-artifact binding on a committed job record.
@@ -600,6 +627,16 @@ func isCompiledHashKey(key string) bool {
 // record — even with byte-identical values — are a duplicate binding and
 // corrupt the read rather than being resolved by key order.
 //
+// Non-ASCII spellings are not accepted even though encoding/json itself
+// would fold them onto the field: its struct-tag matching uses Unicode case
+// folding, under which "compiled_haſh" (U+017F long s, written directly or
+// as the JSON escape u017f) names CompiledHash just like "compiled_hash".
+// Such a lookalike is damage to the binding the record claims to carry and
+// is refused whatever its value — null, a legal hash or an explicit "" —
+// and even when a correctly spelled "compiled_hash" sits beside it, in
+// either key order and whether the two values agree. The damaged binding
+// must never read as an unbound job and disappear on the next commit.
+//
 // Only the binding field is judged here; every other field keeps the
 // ordinary struct decoding.
 func (j *persistJob) UnmarshalJSON(raw []byte) error {
@@ -619,8 +656,17 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 			where = fmt.Sprintf("stored job record %q", id)
 		}
 	}
-	// Every spelling of the binding field counts as the same one field; the
-	// record may carry it at most once, however it is capitalized.
+	// Reject a non-ASCII spelling that encoding/json's Unicode-folded tag
+	// matching would silently read as this field ("compiled_haſh" with long
+	// s, directly written or ſ-escaped), whatever its value and whether
+	// or not a correctly spelled key accompanies it. It must never be ignored
+	// as an unknown member, which would let a damaged binding read unbound.
+	if alias := compiledHashLookalike(members); alias != "" {
+		return corruptf("%s carries the binding field %q under non-ASCII spelling %q; such a lookalike spelling is data corruption",
+			where, compiledHashKey, alias)
+	}
+	// Every accepted spelling of the binding field counts as the same one
+	// field; the record may carry it at most once, however it is capitalized.
 	var bindingKeys []string
 	for key := range members {
 		if isCompiledHashKey(key) {
