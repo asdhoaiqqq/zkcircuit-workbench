@@ -1,7 +1,6 @@
 package zkcircuit
 
 import (
-	"errors"
 	"fmt"
 	"os"
 )
@@ -156,9 +155,11 @@ func (s *Store) GetArtifact(name string, version int) (Artifact, error) {
 // malformed witness (wrong lengths or illegal values; a nil slice stands for
 // an empty one) yields ErrInvalidInput and never reaches evaluation.
 //
-// On success the verdict reports satisfaction, the bound artifact hash and,
-// when unsatisfied, the 1-based index of the first failing constraint. No
-// private input value is included in the result and no proof job is created.
+// The witness strings are converted to field residues once, while they are
+// validated, and evaluation reuses that result. On success the verdict
+// reports satisfaction, the bound artifact hash and, when unsatisfied, the
+// 1-based index of the first failing constraint. No private input value is
+// included in the result and no proof job is created.
 //
 // CheckInputFile applies exactly the same gating, binding and evaluation;
 // only the witness representation differs.
@@ -172,10 +173,11 @@ func (s *Store) CheckInput(name string, version int, hash string, witness Witnes
 		if gerr != nil {
 			return gerr
 		}
-		if err := validateWitness(witness, def.public, def.private); err != nil {
-			return err
+		parsed, perr := parseWitnessValues(witness.Public, witness.Private, def.public, def.private, def.modulus)
+		if perr != nil {
+			return tagInputFormatError(perr)
 		}
-		result = evaluateCheck(def, witness, boundHash)
+		result = evaluateCheck(def, parsed, boundHash)
 		return nil
 	})
 	return result, err
@@ -206,11 +208,15 @@ func (s *Store) CheckInputFile(name string, version int, hash, path string) (Che
 		if gerr != nil {
 			return gerr
 		}
-		witness, werr := parseWitness(raw, def.public, def.private)
-		if werr != nil {
-			return werr
+		pubValues, privValues, derr := witnessArraysFromDocument(raw)
+		if derr != nil {
+			return tagInputFormatError(derr)
 		}
-		result = evaluateCheck(def, witness, boundHash)
+		parsed, perr := parseWitnessValues(pubValues, privValues, def.public, def.private, def.modulus)
+		if perr != nil {
+			return tagInputFormatError(perr)
+		}
+		result = evaluateCheck(def, parsed, boundHash)
 		return nil
 	})
 	return result, err
@@ -264,23 +270,12 @@ func (s *Store) boundCheckDefinition(name string, version int, hash string) (*ca
 }
 
 // evaluateCheck runs the one shared verdict: the 1-based index of the first
-// failing constraint, or zero when every constraint holds.
-func evaluateCheck(def *canonicalDefinition, witness Witness, hash string) CheckResult {
+// failing constraint, or zero when every constraint holds. The witness is
+// already parsed into field residues by parseWitnessValues, so this performs
+// no numeric conversion of its own.
+func evaluateCheck(def *canonicalDefinition, witness parsedWitness, hash string) CheckResult {
 	failure := def.evaluate(witness)
 	return CheckResult{Satisfied: failure == 0, Hash: hash, FirstFailure: failure}
-}
-
-// validateWitness applies the witness grammar and layout rules for an
-// in-API call and tags every rejection as an input format error.
-func validateWitness(w Witness, public, private int) error {
-	if _, err := witnessFromArrays(w.Public, w.Private, public, private); err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
-		}
-		return inputFormatf("%v", err)
-	}
-	return nil
 }
 
 // --- lookup / mapping helpers ---------------------------------------------

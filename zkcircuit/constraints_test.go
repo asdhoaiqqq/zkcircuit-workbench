@@ -3,6 +3,7 @@ package zkcircuit
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
@@ -825,7 +826,85 @@ func TestBigModulusBoundary(t *testing.T) {
 	if d.modulus != 2147483647 {
 		t.Fatalf("modulus %d", d.modulus)
 	}
-	if fail := d.evaluate(Witness{Public: []string{"2"}, Private: []string{"3"}}); fail != 0 {
+	w, werr := parseWitnessValues([]string{"2"}, []string{"3"}, 1, 1, d.modulus)
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	if fail := d.evaluate(w); fail != 0 {
 		t.Fatalf("max-prime evaluate failure at %d", fail)
+	}
+}
+
+// TestParseWitnessValuesParsesOnceThroughBothEntries pins the refactor that
+// removed the second numeric parse: validation now reduces each decimal
+// string into a field residue once and evaluation reuses it. Arbitrarily
+// long positive, negative, leading-zero and negative-zero representations
+// congruent modulo the field must give the same verdict and first-failure
+// position through the file entry and the direct-array entry, and an
+// unsatisfying congruent family must stay unsatisfying at the same place.
+func TestParseWitnessValuesParsesOnceThroughBothEntries(t *testing.T) {
+	s := openTestStore(t)
+	seedDraftWithDef(t, s, "c", 1, 1, 1, validDef) // mod 7: x*y = 6
+	s.FreezeCircuit("c", 1)
+	a, _ := s.CompileCircuit("c", 1)
+	p := big.NewInt(7)
+	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(64), nil) // 10^64
+	k := new(big.Int).Mul(pow, p)                                // a multiple of the modulus
+
+	// Satisfying residue pair (2,3) expressed as: huge positive, huge
+	// negative and leading zeros.
+	satisfying := []struct{ pub, priv string }{
+		{"2", "3"},
+		{new(big.Int).Add(big.NewInt(2), k).String(), new(big.Int).Sub(big.NewInt(3), k).String()},
+		{"00000000000000000000000000000000000000000002", "-0000000000000000000000000000000000000004"},
+		{"-0000000000000000000000000000000000000005", "0003"}, // -5 ≡ 2
+	}
+	// Negative zero is a legal representation of residue 0 and parses once
+	// to 0 like every other value.
+	if pw, err := parseWitnessValues([]string{"-0"}, nil, 1, 0, 7); err != nil || len(pw.public) != 1 || pw.public[0] != 0 {
+		t.Fatalf(`negative zero must parse once to residue 0, got %+v %v`, pw, err)
+	}
+	for i, tc := range satisfying {
+		direct, err := s.CheckInput("c", 1, a.Hash, Witness{Public: []string{tc.pub}, Private: []string{tc.priv}})
+		if err != nil {
+			t.Fatalf("satisfying case %d direct: %v", i, err)
+		}
+		doc := fmt.Sprintf(`{"public":["%s"],"private":["%s"]}`, tc.pub, tc.priv)
+		file, err := s.CheckInputFile("c", 1, a.Hash, writeTempJSON(t, doc))
+		if err != nil {
+			t.Fatalf("satisfying case %d file: %v", i, err)
+		}
+		if !direct.Satisfied || direct.FirstFailure != 0 || direct.Hash != a.Hash {
+			t.Fatalf("satisfying case %d direct verdict changed: %+v", i, direct)
+		}
+		if direct != file {
+			t.Fatalf("satisfying case %d: direct=%+v file=%+v", i, direct, file)
+		}
+	}
+
+	// Unsatisfying pair (2,4) fails first at constraint 1; congruent huge
+	// rewrites must keep the unsatisfied verdict and the same position at
+	// both entries (unsatisfied is a completed check, exit-class success).
+	unsatisfying := []struct{ pub, priv string }{
+		{"2", "4"},
+		{new(big.Int).Sub(big.NewInt(2), k).String(), new(big.Int).Add(big.NewInt(4), k).String()},
+		{"-0000000000000000000000000000000000000005", "00000000000000000000000000000000000000000004"},
+	}
+	for i, tc := range unsatisfying {
+		direct, err := s.CheckInput("c", 1, a.Hash, Witness{Public: []string{tc.pub}, Private: []string{tc.priv}})
+		if err != nil {
+			t.Fatalf("unsatisfying case %d must be a completed check: %v", i, err)
+		}
+		doc := fmt.Sprintf(`{"public":["%s"],"private":["%s"]}`, tc.pub, tc.priv)
+		file, err := s.CheckInputFile("c", 1, a.Hash, writeTempJSON(t, doc))
+		if err != nil {
+			t.Fatalf("unsatisfying case %d file: %v", i, err)
+		}
+		if direct.Satisfied || direct.FirstFailure != 1 || direct.Hash != a.Hash {
+			t.Fatalf("unsatisfying case %d direct verdict changed: %+v", i, direct)
+		}
+		if direct != file {
+			t.Fatalf("unsatisfying case %d: direct=%+v file=%+v", i, direct, file)
+		}
 	}
 }

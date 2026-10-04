@@ -496,24 +496,59 @@ func definitionFromPersist(p persistDefinition, public, private int) (*canonical
 
 // ---- input checking -------------------------------------------------------
 
-// parseWitness validates the check input JSON and tags every rejection as an
-// input format error (ErrInvalidInput), distinct from domain rule failures.
-func parseWitness(raw []byte, public, private int) (Witness, error) {
-	w, err := parseWitnessDocument(raw, public, private)
-	if err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return Witness{}, StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
-		}
-		return Witness{}, inputFormatf("%v", err)
-	}
-	return w, nil
+// parsedWitness is a validated input assignment ready for modular
+// evaluation. Each decimal string has been scanned, parsed to a big.Int and
+// reduced into [0, modulus) exactly once; constraint evaluation consumes
+// these residues directly, so validation and evaluation never parse the same
+// input value twice. The wire layout stays wire 0 = constant 1, then the
+// public inputs, then the private inputs, in declaration order.
+type parsedWitness struct {
+	public  []int64
+	private []int64
 }
 
-// parseWitnessDocument parses and validates a check input document: both
-// groups must be present as arrays, their lengths must match the
-// declaration, and every value must be an arbitrarily long signed decimal
-// string.
+// parseWitness validates the check input JSON and tags every rejection as an
+// input format error (ErrInvalidInput), distinct from domain rule failures.
+// It is the modulus-independent document parser: envelope, arrays, counts
+// and the decimal grammar. Both check entry points instead run the extracted
+// arrays through parseWitnessValues, which performs the same checks and the
+// single numeric parse together.
+func parseWitness(raw []byte, public, private int) (Witness, error) {
+	pubValues, privValues, err := witnessArraysFromDocument(raw)
+	if err != nil {
+		return Witness{}, tagInputFormatError(err)
+	}
+	if err := checkWitnessCounts(pubValues, privValues, public, private); err != nil {
+		return Witness{}, tagInputFormatError(err)
+	}
+	if err := validateWitnessValues(pubValues, "public", true); err != nil {
+		return Witness{}, tagInputFormatError(err)
+	}
+	if err := validateWitnessValues(privValues, "private", false); err != nil {
+		return Witness{}, tagInputFormatError(err)
+	}
+	return Witness{Public: pubValues, Private: privValues}, nil
+}
+
+// tagInputFormatError reports a witness rejection under the input format
+// error category. The structural parsers tag their problems as invalid
+// arguments before an entry point knows the document was a check witness, so
+// the kind is normalized here at the witness boundary.
+func tagInputFormatError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se StoreError
+	if errors.As(err, &se) {
+		return StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
+	}
+	return inputFormatf("%v", err)
+}
+
+// witnessArraysFromDocument parses and validates only the check input
+// document's shape: both groups must be present as arrays of JSON strings.
+// Length and value rules are applied afterwards by parseWitnessValues, which
+// both entry points run next.
 //
 // Privacy rule. Diagnostics for the private group never quote a private
 // value, a character or fragment taken from one, an object key found inside
@@ -523,28 +558,28 @@ func parseWitness(raw []byte, public, private int) (Witness, error) {
 // without learning its private contents. Public diagnostics keep their full
 // detail. When a document is too damaged to tell which group a token belongs
 // to, it is rejected generically as malformed JSON with no source quoted.
-func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
+func witnessArraysFromDocument(raw []byte) (pubValues, privValues []string, err error) {
 	members, err := splitWitnessObject(raw)
 	if err != nil {
-		return Witness{}, err
+		return nil, nil, err
 	}
 	publicRaw, havePublic := members["public"]
 	privateRaw, havePrivate := members["private"]
 	if !havePublic {
-		return Witness{}, invalidf("input is missing required field %q: the public group must be an array of decimal strings", "public")
+		return nil, nil, invalidf("input is missing required field %q: the public group must be an array of decimal strings", "public")
 	}
 	if !havePrivate {
-		return Witness{}, invalidf("input is missing required field %q: the private group must be an array of decimal strings", "private")
+		return nil, nil, invalidf("input is missing required field %q: the private group must be an array of decimal strings", "private")
 	}
-	pubValues, err := parsePublicArray(publicRaw)
+	pubValues, err = parsePublicArray(publicRaw)
 	if err != nil {
-		return Witness{}, err
+		return nil, nil, err
 	}
-	privValues, err := parsePrivateArray(privateRaw)
+	privValues, err = parsePrivateArray(privateRaw)
 	if err != nil {
-		return Witness{}, err
+		return nil, nil, err
 	}
-	return witnessFromArrays(pubValues, privValues, public, private)
+	return pubValues, privValues, nil
 }
 
 // splitWitnessObject walks only the top-level {"public":…,"private":…}
@@ -667,34 +702,30 @@ func parsePrivateArray(raw json.RawMessage) ([]string, error) {
 	return values, nil
 }
 
-// witnessFromArrays applies the single witness grammar and layout rule
-// shared by both check entry points: each group must contain exactly the
-// declared number of decimal strings. A nil slice is accepted wherever an
-// empty one would be (an in-API witness declaring zero inputs); unlike the
-// JSON entry point nothing here distinguishes "omitted" from "empty".
-// Private values are never echoed; private problems are identified by index.
-func witnessFromArrays(pubValues, privValues []string, public, private int) (Witness, error) {
+// checkWitnessCounts applies the layout rule shared by both check entry
+// points: each group must contain exactly the declared number of values. A
+// nil slice is accepted wherever an empty one would be (an in-API witness
+// declaring zero inputs); unlike the JSON entry point nothing here
+// distinguishes "omitted" from "empty".
+func checkWitnessCounts(pubValues, privValues []string, public, private int) error {
 	if len(pubValues) != public {
-		return Witness{}, invalidf("public input array has %d values but the version requires %d decimal strings",
+		return invalidf("public input array has %d values but the version requires %d decimal strings",
 			len(pubValues), public)
 	}
 	if len(privValues) != private {
-		return Witness{}, invalidf("private input array has %d values but the version requires %d decimal strings",
+		return invalidf("private input array has %d values but the version requires %d decimal strings",
 			len(privValues), private)
 	}
-	if err := validateWitnessValues(pubValues, "public", true); err != nil {
-		return Witness{}, err
-	}
-	if err := validateWitnessValues(privValues, "private", false); err != nil {
-		return Witness{}, err
-	}
-	return Witness{Public: pubValues, Private: privValues}, nil
+	return nil
 }
 
 // validateWitnessValues checks that every entry is an arbitrarily long
-// signed decimal string. Public values may be echoed with the parser's
-// detailed reason; private values are never quoted, and their failure is
-// described structurally (see signedDecimalKind) with a 1-based index.
+// signed decimal string, without reducing it. It stays available for callers
+// that only validate; the check entry points use parseWitnessValues, which
+// combines this grammar check with the single numeric parse and modular
+// reduction. Public values may be echoed with the parser's detailed reason;
+// private values are never quoted, and their failure is described
+// structurally (see signedDecimalKind) with a 1-based index.
 func validateWitnessValues(values []string, which string, echo bool) error {
 	for i, v := range values {
 		if _, err := parseBigSignedDecimal(v); err != nil {
@@ -707,24 +738,60 @@ func validateWitnessValues(values []string, which string, echo bool) error {
 	return nil
 }
 
-// evaluate checks every constraint against the witness and returns the
-// 1-based index of the first failure, or 0 when all hold.
-func (d *canonicalDefinition) evaluate(w Witness) int {
+// parseWitnessValues is the one shared witness pipeline for both check entry
+// points. It enforces the declared counts and the signed-decimal grammar, and
+// for each legal value it performs the only numeric conversion of the whole
+// check — scanning the digits, building the big.Int and reducing it into
+// [0, modulus) — and hands the residues to the evaluator. Previously the
+// grammar check built a throwaway big.Int per value and the evaluator parsed
+// the same strings a second time; arbitrarily long legal inputs paid for two
+// conversions. A nil slice is accepted wherever an empty one would be.
+//
+// Diagnostics are unchanged. Public values may be echoed with the parser's
+// detailed reason; private values are never quoted and their failure is
+// described structurally (see signedDecimalKind) with a 1-based index.
+func parseWitnessValues(pubValues, privValues []string, public, private int, modulus int64) (parsedWitness, error) {
+	if err := checkWitnessCounts(pubValues, privValues, public, private); err != nil {
+		return parsedWitness{}, err
+	}
+	bigP := big.NewInt(modulus)
+	reduce := func(values []string, which string, echo bool) ([]int64, error) {
+		residues := make([]int64, len(values))
+		for i, v := range values {
+			n, err := parseBigSignedDecimal(v)
+			if err != nil {
+				if echo {
+					return nil, invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
+				}
+				return nil, invalidf("%s input #%d is not a decimal integer: %s", which, i+1, signedDecimalKind(v))
+			}
+			n.Mod(n, bigP) // into [0,p); Go's Mod keeps the sign of p
+			residues[i] = n.Int64()
+		}
+		return residues, nil
+	}
+	pubResidues, err := reduce(pubValues, "public", true)
+	if err != nil {
+		return parsedWitness{}, err
+	}
+	privResidues, err := reduce(privValues, "private", false)
+	if err != nil {
+		return parsedWitness{}, err
+	}
+	return parsedWitness{public: pubResidues, private: privResidues}, nil
+}
+
+// evaluate checks every constraint against an already-parsed witness and
+// returns the 1-based index of the first failure, or 0 when all hold. It
+// never reparses an input string: the residues in w are the single result of
+// parseWitnessValues.
+func (d *canonicalDefinition) evaluate(w parsedWitness) int {
 	p := d.modulus
 	// Wire layout: 0 = 1, then public inputs, then private inputs.
-	values := make([]int64, 1+d.public+d.private)
+	values := make([]int64, 1+len(w.public)+len(w.private))
 	values[0] = 1
-	bigP := big.NewInt(p)
-	for i, s := range w.Public {
-		n, _ := parseBigSignedDecimal(s)
-		n.Mod(n, bigP)
-		values[1+i] = n.Int64()
-	}
-	for i, s := range w.Private {
-		n, _ := parseBigSignedDecimal(s)
-		n.Mod(n, bigP)
-		values[1+d.public+i] = n.Int64()
-	}
+	copy(values[1:], w.public)
+	copy(values[1+len(w.public):], w.private)
 	combo := func(terms []parsedTerm) int64 {
 		var sum int64
 		for _, t := range terms {
