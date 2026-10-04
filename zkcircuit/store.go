@@ -561,7 +561,9 @@ const compiledHashKey = "compiled_hash"
 // field, allowing differences in ASCII letter case only: "compiled_hash",
 // "COMPILED_HASH" and every mixed-case spelling are the same field. Keys are
 // already JSON-unescaped at this point, so an escaped spelling of any of
-// these forms lands here too. Non-ASCII lookalikes never match.
+// these forms lands here too. Non-ASCII lookalikes never match, even when
+// Unicode case folding would put them on the same field (see
+// isCompiledHashLookalike).
 func isCompiledHashKey(key string) bool {
 	if len(key) != len(compiledHashKey) {
 		return false
@@ -576,6 +578,24 @@ func isCompiledHashKey(key string) bool {
 		}
 	}
 	return true
+}
+
+// isCompiledHashLookalike reports whether key names the compiled-artifact
+// binding field under a non-ASCII spelling: anything encoding/json folds onto
+// the struct tag "compiled_hash" (strings.EqualFold follows Unicode case
+// folding, exactly like the decoder's foldedNameIndex) that is not one of the
+// accepted ASCII letter-case spellings. For this field name the only such
+// fold alias is a long s (U+017F) standing in for the ASCII s,
+// "compiled_haſh"; the predicate stays generic so any other spelling
+// Unicode folding equates with the tag is caught the same way. The field is
+// the one place a key the writer did not emit can be silently matched by the
+// ordinary struct decode, so every such spelling is data corruption: it is
+// never ignored (which would let a damaged binding read as the unbound state
+// and vanish on the next commit), and it is never treated as a selectable
+// binding value. Keys are already JSON-unescaped here, so the long s written
+// as a \u017f escape is caught the same as the literal rune.
+func isCompiledHashLookalike(key string) bool {
+	return !isCompiledHashKey(key) && strings.EqualFold(key, compiledHashKey)
 }
 
 // Strict decoding of the compiled-artifact binding on a committed job record.
@@ -600,6 +620,19 @@ func isCompiledHashKey(key string) bool {
 // record — even with byte-identical values — are a duplicate binding and
 // corrupt the read rather than being resolved by key order.
 //
+// A non-ASCII spelling that Unicode case folding puts on the same field
+// — "compiled_haſh" with a long s (U+017F), written literally or as
+// the JSON escape "compiled_ha\u017fh" — is refused outright
+// regardless of its value (null, a legal hash or an empty string) and
+// regardless of whether the standard spelling is also present, in whichever
+// order the two keys appear and whether or not their values agree. Ignoring
+// such a key is not an option: the ordinary struct decode below folds it
+// onto compiled_hash itself, so a null would read as an unbound job and the
+// next commit would erase the binding. Refusing one spelling but accepting
+// the other when both occur is likewise forbidden — the whole record (and
+// with it the directory read) is rejected, never a record where one of two
+// binding values gets picked.
+//
 // Only the binding field is judged here; every other field keeps the
 // ordinary struct decoding.
 func (j *persistJob) UnmarshalJSON(raw []byte) error {
@@ -619,8 +652,27 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 			where = fmt.Sprintf("stored job record %q", id)
 		}
 	}
-	// Every spelling of the binding field counts as the same one field; the
-	// record may carry it at most once, however it is capitalized.
+	// Refuse non-ASCII spellings of the binding field before anything else:
+	// the ordinary struct decode below folds them onto compiled_hash on its
+	// own, so leaving one around would validate a different value than the
+	// one this record visibly carries. Sorting keeps the message stable.
+	var lookalikeKeys []string
+	for key := range members {
+		if isCompiledHashLookalike(key) {
+			lookalikeKeys = append(lookalikeKeys, key)
+		}
+	}
+	if len(lookalikeKeys) > 0 {
+		sort.Strings(lookalikeKeys)
+		quoted := make([]string, len(lookalikeKeys))
+		for i, k := range lookalikeKeys {
+			quoted[i] = strconv.Quote(k)
+		}
+		return corruptf("%s field %q is spelled with a non-ASCII lookalike key (%s); the binding field must be spelled %q",
+			where, compiledHashKey, strings.Join(quoted, ", "), compiledHashKey)
+	}
+	// Every ASCII-case spelling of the binding field counts as the same one
+	// field; the record may carry it at most once, however it is capitalized.
 	var bindingKeys []string
 	for key := range members {
 		if isCompiledHashKey(key) {
