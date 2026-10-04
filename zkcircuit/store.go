@@ -42,7 +42,13 @@ const (
 // the envelope's top level that comparison is case-insensitive for the five
 // known fields (format/circuits/setups/jobs/artifacts): a second spelling
 // that differs only in ASCII letter case — including one JSON-escaped — names
-// the same field and corrupts the read instead of overriding it.
+// the same field and corrupts the read instead of overriding it. A spelling
+// that Unicode case-folds onto one of those fields yet is not an ASCII case
+// variant ("circuitſ" with U+017F long s, directly written or ſ-escaped)
+// is likewise corruption even when it is the only spelling present, since
+// encoding/json's own tag matching would fill the field from it; a later
+// "circuitſ": [] must never read the circuits as empty and drop them on the
+// next commit.
 type envelope struct {
 	Format    int               `json:"format"`
 	Circuits  []persistCircuit  `json:"circuits"`
@@ -137,6 +143,32 @@ func canonicalEnvelopeField(key string) string {
 	return ""
 }
 
+// envelopeFieldLookalike reports the standard lowercase name of one of the
+// five envelope fields when key names it under a spelling encoding/json's
+// struct-tag matching would fold onto the field but which is not an accepted
+// ASCII letter-case spelling (canonicalEnvelopeField reports those). Tag
+// matching folds with the Unicode simple case-folding rules
+// (strings.EqualFold), so "circuitſ" (U+017F long s, written directly or as
+// the JSON escape u017f — keys arrive here already unescaped) names the
+// circuits field exactly like "circuits", even standing alone. Such a
+// lookalike is damage whatever its value: a later "circuitſ": [] would
+// otherwise override a populated circuits array through last-value-wins and
+// the records would vanish on the next commit. A key that does not fold onto
+// any known field — an unrelated unknown name such as "note", or "cİrcuits"
+// with U+0130 dotted capital I, which does not fold — returns "" and keeps
+// the ordinary unknown-member handling.
+func envelopeFieldLookalike(key string) string {
+	if canonicalEnvelopeField(key) != "" {
+		return "" // an accepted ASCII spelling, not a lookalike
+	}
+	for _, field := range envelopeTopFields {
+		if strings.EqualFold(key, field) {
+			return field
+		}
+	}
+	return ""
+}
+
 // scanEnvelopeDuplicates tokenizes the committed envelope and rejects every
 // repeated object key. The five known top-level fields are identified case-
 // insensitively: two spellings that differ only in ASCII letter case (both
@@ -145,6 +177,17 @@ func canonicalEnvelopeField(key string) string {
 // "CIRCUITS" or "FORMAT" can never override an earlier one through encoding/
 // json's last-value-wins struct matching. Such a pair is reported as a
 // duplicated top-level field named by its standard lowercase spelling.
+//
+// A non-ASCII spelling that folds onto a known field but is not an ASCII case
+// variant ("circuitſ", "setupſ", "jobſ", "artifactſ" with U+017F long s,
+// directly written or ſ-escaped) is rejected outright as data corruption:
+// encoding/json would match it onto the field, so ignoring it as unknown
+// could let its value replace the real one (an empty array hiding every
+// record), and accepting it would let the records vanish on the next commit.
+// The rule holds for the lookalike appearing alone — value a legal record, an
+// empty array or null alike — and for it appearing beside the canonical
+// spelling or an ASCII case variant, in either order and whether the values
+// agree. The error names both the standard field and the actual spelling.
 //
 // Circuit records are scanned one level deep only — their top-level fields
 // are checked here (with the record's 1-based index reported), while values
@@ -172,6 +215,17 @@ func scanEnvelopeDuplicates(raw []byte) error {
 		key, ok := keyTok.(string)
 		if !ok {
 			return corruptf("data file envelope is not valid JSON")
+		}
+		// Reject a non-ASCII spelling that encoding/json's Unicode-folded tag
+		// matching would read as a known field ("circuitſ" with long s,
+		// directly written or ſ-escaped) before anything else. It is damage
+		// even on its own and whatever its value — a legal record, an empty
+		// array or null — and whether it precedes or follows the canonical or
+		// an ASCII case-variant spelling: the read may neither ignore it as an
+		// unknown member nor choose one of the values and carry on.
+		if canonical := envelopeFieldLookalike(key); canonical != "" {
+			return corruptf("data file envelope carries top-level field %q under non-ASCII spelling %q; such a lookalike spelling is data corruption",
+				canonical, key)
 		}
 		if canonical := canonicalEnvelopeField(key); canonical != "" {
 			if seenCanonical[canonical] {
