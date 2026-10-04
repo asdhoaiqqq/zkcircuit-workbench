@@ -797,6 +797,13 @@ func validateEnvelope(env envelope) error {
 		if c.PublicInputs < 0 || c.PrivateInputs < 0 {
 			return fmt.Errorf("circuit %q v%d: input counts must not be negative", c.Name, c.Version)
 		}
+		// A layout that cannot be represented with this platform's int is
+		// refused here too: the record is left in place and reported as
+		// corruption rather than silently shrunk or skipped.
+		if inputLayoutOverflows(c.PublicInputs, c.PrivateInputs) {
+			return fmt.Errorf("circuit %q v%d: input layout exceeds the representable range (%d public + %d private inputs plus the constant wire 0)",
+				c.Name, c.Version, c.PublicInputs, c.PrivateInputs)
+		}
 		if c.Definition != nil {
 			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
 				return err

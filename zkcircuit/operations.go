@@ -1,6 +1,7 @@
 package zkcircuit
 
 import (
+	"math"
 	"sort"
 	"strings"
 )
@@ -14,7 +15,8 @@ import (
 //
 // The name must be non-empty and not only whitespace; Version must be
 // positive; Constraints must be positive; the input counts must not be
-// negative. Creating an already-existing version is idempotent when the
+// negative and their wire layout (constant wire 0 plus every public and
+// private input) must fit this platform's int. Creating an already-existing version is idempotent when the
 // description is identical (the stored record is returned unchanged); a
 // differing description is reported as ErrConflict. Nothing about an
 // existing version — frozen or not — is ever replaced by Create.
@@ -109,9 +111,10 @@ type PartialCircuit struct {
 // values. A non-nil pointer still replaces its field even when it points at
 // zero or the empty string (explicit zero clears an input count, an empty
 // string clears the description). The whole merged result is validated
-// before anything is committed: constraints must stay positive and input
-// counts non-negative, and when a constraint definition is already imported
-// the merged counts must keep it legal (exact constraint count, every
+// before anything is committed: constraints must stay positive, input
+// counts non-negative and the merged wire layout inside this platform's
+// int, and when a constraint definition is already imported the merged
+// counts must keep it legal (exact constraint count, every
 // referenced wire inside the new input layout). Any rejected field refuses
 // the entire change — description, counts and the stored definition all
 // remain as they were. The merged result is checked through the same
@@ -195,9 +198,11 @@ type circuitMutation struct {
 }
 
 // validateMutationCounts holds the basic count rules for any draft update:
-// constraints must be greater than zero and both input counts must not be
-// negative. The rules are judged on the mutation's complete resulting
-// counts, not on the supplied fields alone.
+// constraints must be greater than zero, both input counts must not be
+// negative and the resulting wire layout (constant wire 0 plus every public
+// and private input) must fit this platform's int. The rules are judged on
+// the mutation's complete resulting counts, not on the supplied fields
+// alone.
 func validateMutationCounts(m circuitMutation) error {
 	return validateCounts(m.Constraints, m.PublicInputs, m.PrivateInputs)
 }
@@ -553,7 +558,22 @@ func validateCounts(constraints, publicInputs, privateInputs int) error {
 	if privateInputs < 0 {
 		return invalidf("private input count must not be negative, got %d", privateInputs)
 	}
+	if inputLayoutOverflows(publicInputs, privateInputs) {
+		return invalidf("input layout exceeds the representable range: %d public + %d private inputs plus the constant wire 0 does not fit this platform's int (max %d)",
+			publicInputs, privateInputs, math.MaxInt)
+	}
 	return nil
+}
+
+// inputLayoutOverflows reports whether the wire layout implied by the input
+// counts — wire 0 for the constant plus one slot per public and private
+// input — cannot be represented with this platform's int. The counts are
+// already known non-negative, so the layout size 1+public+private can only
+// fail by overflowing; the comparison is arranged so it never wraps. The
+// bound is the platform's int range itself, not a smaller circuit-size
+// limit: public+private == MaxInt-1 stays legal.
+func inputLayoutOverflows(publicInputs, privateInputs int) bool {
+	return publicInputs > math.MaxInt-1-privateInputs
 }
 
 // --- lookup / mapping helpers --------------------------------------------
