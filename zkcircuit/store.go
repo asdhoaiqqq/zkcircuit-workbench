@@ -38,7 +38,11 @@ const (
 // UnmarshalJSON — rather than encoding/json's silent zero-value filling —
 // decides what a committed circuit record may look like. UnmarshalJSON first
 // walks the token stream (scanEnvelopeDuplicates) and rejects a repeated
-// object key anywhere encoding/json would otherwise keep the last value.
+// object key anywhere encoding/json would otherwise keep the last value. At
+// the envelope's top level that comparison is case-insensitive for the five
+// known fields (format/circuits/setups/jobs/artifacts): a second spelling
+// that differs only in ASCII letter case — including one JSON-escaped — names
+// the same field and corrupts the read instead of overriding it.
 type envelope struct {
 	Format    int               `json:"format"`
 	Circuits  []persistCircuit  `json:"circuits"`
@@ -99,13 +103,55 @@ func (e *envelope) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// envelopeTopFields are the five fields an envelope may carry. Their
+// canonical (standard lowercase) spellings are the wire tags on envelope and
+// envelopeWire; JSON keys are tokenized after unescaping.
+var envelopeTopFields = []string{"format", "circuits", "setups", "jobs", "artifacts"}
+
+// canonicalEnvelopeField reports the standard lowercase name of one of the
+// five envelope fields when key names it under any ASCII letter-case spelling
+// ("format", "FORMAT", "FoRmAt", …). Keys are already JSON-unescaped by the
+// tokenizer, so an escaped spelling of any such form lands here too. A
+// non-canonical key (different length or a mismatching byte, including
+// non-ASCII lookalikes and unknown fields such as "CIRCUIT") returns "".
+func canonicalEnvelopeField(key string) string {
+	for _, field := range envelopeTopFields {
+		if len(key) != len(field) {
+			continue
+		}
+		i := 0
+		for i < len(key) {
+			c := key[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != field[i] {
+				break
+			}
+			i++
+		}
+		if i == len(field) {
+			return field
+		}
+	}
+	return ""
+}
+
 // scanEnvelopeDuplicates tokenizes the committed envelope and rejects every
-// repeated object key. Circuit records are scanned one level deep only —
-// their top-level fields are checked here (with the record's 1-based index
-// reported), while values such as the constraint definition are skipped and
-// left to their own strict decoders. Every other envelope member is scanned
-// recursively so a duplicated key anywhere in committed data fails the read
-// instead of silently resolving to its last value.
+// repeated object key. The five known top-level fields are identified case-
+// insensitively: two spellings that differ only in ASCII letter case (both
+// keys already JSON-unescaped at this point) are the same field, in whatever
+// order they appear and whether or not their values agree, so a later
+// "CIRCUITS" or "FORMAT" can never override an earlier one through encoding/
+// json's last-value-wins struct matching. Such a pair is reported as a
+// duplicated top-level field named by its standard lowercase spelling.
+//
+// Circuit records are scanned one level deep only — their top-level fields
+// are checked here (with the record's 1-based index reported), while values
+// such as the constraint definition are skipped and left to their own strict
+// decoders. Every other envelope member is scanned recursively so a
+// duplicated key anywhere in committed data fails the read instead of
+// silently resolving to its last value.
 func scanEnvelopeDuplicates(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
 	dec.UseNumber()
@@ -113,7 +159,11 @@ func scanEnvelopeDuplicates(raw []byte) error {
 	if err != nil || open != json.Delim('{') {
 		return corruptf("data file envelope must be a JSON object")
 	}
+	// Exact spellings retain the pre-existing check for unknown keys;
+	// canonical names remember a known field's first occurrence regardless
+	// of the case it was written in.
 	seenTop := make(map[string]bool)
+	seenCanonical := make(map[string]bool)
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -123,16 +173,30 @@ func scanEnvelopeDuplicates(raw []byte) error {
 		if !ok {
 			return corruptf("data file envelope is not valid JSON")
 		}
-		if seenTop[key] {
-			return corruptf("data file envelope contains duplicate field %q", key)
-		}
-		seenTop[key] = true
-		if key == "circuits" {
-			if err := scanCircuitArrayDuplicates(dec); err != nil {
+		if canonical := canonicalEnvelopeField(key); canonical != "" {
+			if seenCanonical[canonical] {
+				if key == canonical {
+					return corruptf("data file envelope contains duplicate top-level field %q", canonical)
+				}
+				return corruptf("data file envelope contains duplicate top-level field %q (also present as %q)",
+					canonical, key)
+			}
+			seenCanonical[canonical] = true
+			if canonical == "circuits" {
+				if err := scanCircuitArrayDuplicates(dec); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := skipValueWithDupKeys(dec, "data file envelope field "+strconv.Quote(canonical)); err != nil {
 				return err
 			}
 			continue
 		}
+		if seenTop[key] {
+			return corruptf("data file envelope contains duplicate field %q", key)
+		}
+		seenTop[key] = true
 		if err := skipValueWithDupKeys(dec, "data file envelope field "+strconv.Quote(key)); err != nil {
 			return err
 		}
@@ -147,8 +211,10 @@ func scanEnvelopeDuplicates(raw []byte) error {
 }
 
 // scanCircuitArrayDuplicates consumes one "circuits" value positioned at its
-// opening bracket and checks only each record's own top-level keys. A null
-// array stays the pre-existing "no records" reading.
+// opening bracket and checks only each record's own top-level keys. The
+// enclosing key may carry any case spelling, but the field it names is the
+// canonical "circuits". A null array stays the pre-existing "no records"
+// reading.
 func scanCircuitArrayDuplicates(dec *json.Decoder) error {
 	tok, err := dec.Token()
 	if err != nil {
