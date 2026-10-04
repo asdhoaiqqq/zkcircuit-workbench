@@ -76,6 +76,18 @@ type Witness struct {
 	Private []string
 }
 
+// checkedWitness is a witness that has passed the layout and decimal-grammar
+// rules, with every value already converted from its decimal string to a big
+// integer — exactly once per value. Evaluation reduces these integers into
+// the field without ever reconverting the original strings, so a long legal
+// input pays the text-to-integer conversion a single time across validation
+// and constraint checking. The integers are kept at full precision; the
+// modulus is only applied when the wire values are built for evaluation.
+type checkedWitness struct {
+	public  []*big.Int
+	private []*big.Int
+}
+
 // ---- parsed / canonical in-memory representation -------------------------
 
 // parsedTerm is a validated term whose coefficient has been reduced into
@@ -499,21 +511,41 @@ func definitionFromPersist(p persistDefinition, public, private int) (*canonical
 // parseWitness validates the check input JSON and tags every rejection as an
 // input format error (ErrInvalidInput), distinct from domain rule failures.
 func parseWitness(raw []byte, public, private int) (Witness, error) {
-	w, err := parseWitnessDocument(raw, public, private)
+	w, _, err := parseWitnessDocument(raw, public, private)
 	if err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return Witness{}, StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
-		}
-		return Witness{}, inputFormatf("%v", err)
+		return Witness{}, tagWitnessError(err)
 	}
 	return w, nil
+}
+
+// parseWitnessChecked is the check-flow form of parseWitness: same document
+// rules and the same input-format tagging, but it returns the checked
+// witness whose values were converted to integers once during validation, so
+// the evaluation that follows never parses the decimal strings again.
+func parseWitnessChecked(raw []byte, public, private int) (checkedWitness, error) {
+	_, checked, err := parseWitnessDocument(raw, public, private)
+	if err != nil {
+		return checkedWitness{}, tagWitnessError(err)
+	}
+	return checked, nil
+}
+
+// tagWitnessError tags any witness rejection as an input format error
+// (ErrInvalidInput), keeping the detailed message but replacing the kind.
+func tagWitnessError(err error) error {
+	var se StoreError
+	if errors.As(err, &se) {
+		return StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
+	}
+	return inputFormatf("%v", err)
 }
 
 // parseWitnessDocument parses and validates a check input document: both
 // groups must be present as arrays, their lengths must match the
 // declaration, and every value must be an arbitrarily long signed decimal
-// string.
+// string. It returns both the string form and the checked form whose values
+// were converted to integers during validation, so callers bound for
+// evaluation never parse the same strings a second time.
 //
 // Privacy rule. Diagnostics for the private group never quote a private
 // value, a character or fragment taken from one, an object key found inside
@@ -523,28 +555,32 @@ func parseWitness(raw []byte, public, private int) (Witness, error) {
 // without learning its private contents. Public diagnostics keep their full
 // detail. When a document is too damaged to tell which group a token belongs
 // to, it is rejected generically as malformed JSON with no source quoted.
-func parseWitnessDocument(raw []byte, public, private int) (Witness, error) {
+func parseWitnessDocument(raw []byte, public, private int) (Witness, checkedWitness, error) {
 	members, err := splitWitnessObject(raw)
 	if err != nil {
-		return Witness{}, err
+		return Witness{}, checkedWitness{}, err
 	}
 	publicRaw, havePublic := members["public"]
 	privateRaw, havePrivate := members["private"]
 	if !havePublic {
-		return Witness{}, invalidf("input is missing required field %q: the public group must be an array of decimal strings", "public")
+		return Witness{}, checkedWitness{}, invalidf("input is missing required field %q: the public group must be an array of decimal strings", "public")
 	}
 	if !havePrivate {
-		return Witness{}, invalidf("input is missing required field %q: the private group must be an array of decimal strings", "private")
+		return Witness{}, checkedWitness{}, invalidf("input is missing required field %q: the private group must be an array of decimal strings", "private")
 	}
 	pubValues, err := parsePublicArray(publicRaw)
 	if err != nil {
-		return Witness{}, err
+		return Witness{}, checkedWitness{}, err
 	}
 	privValues, err := parsePrivateArray(privateRaw)
 	if err != nil {
-		return Witness{}, err
+		return Witness{}, checkedWitness{}, err
 	}
-	return witnessFromArrays(pubValues, privValues, public, private)
+	checked, err := witnessFromArrays(pubValues, privValues, public, private)
+	if err != nil {
+		return Witness{}, checkedWitness{}, err
+	}
+	return Witness{Public: pubValues, Private: privValues}, checked, nil
 }
 
 // splitWitnessObject walks only the top-level {"public":…,"private":…}
@@ -673,58 +709,92 @@ func parsePrivateArray(raw json.RawMessage) ([]string, error) {
 // empty one would be (an in-API witness declaring zero inputs); unlike the
 // JSON entry point nothing here distinguishes "omitted" from "empty".
 // Private values are never echoed; private problems are identified by index.
-func witnessFromArrays(pubValues, privValues []string, public, private int) (Witness, error) {
+//
+// Every value is converted from its decimal string to a big integer here,
+// once, and the converted form is returned for evaluation — this is the only
+// text-to-integer conversion a checked input ever goes through.
+func witnessFromArrays(pubValues, privValues []string, public, private int) (checkedWitness, error) {
 	if len(pubValues) != public {
-		return Witness{}, invalidf("public input array has %d values but the version requires %d decimal strings",
+		return checkedWitness{}, invalidf("public input array has %d values but the version requires %d decimal strings",
 			len(pubValues), public)
 	}
 	if len(privValues) != private {
-		return Witness{}, invalidf("private input array has %d values but the version requires %d decimal strings",
+		return checkedWitness{}, invalidf("private input array has %d values but the version requires %d decimal strings",
 			len(privValues), private)
 	}
-	if err := validateWitnessValues(pubValues, "public", true); err != nil {
-		return Witness{}, err
+	pub, err := parseDecimalValues(pubValues, "public", true)
+	if err != nil {
+		return checkedWitness{}, err
 	}
-	if err := validateWitnessValues(privValues, "private", false); err != nil {
-		return Witness{}, err
+	priv, err := parseDecimalValues(privValues, "private", false)
+	if err != nil {
+		return checkedWitness{}, err
 	}
-	return Witness{Public: pubValues, Private: privValues}, nil
+	return checkedWitness{public: pub, private: priv}, nil
 }
 
-// validateWitnessValues checks that every entry is an arbitrarily long
-// signed decimal string. Public values may be echoed with the parser's
-// detailed reason; private values are never quoted, and their failure is
-// described structurally (see signedDecimalKind) with a 1-based index.
-func validateWitnessValues(values []string, which string, echo bool) error {
+// parseDecimalValues checks that every entry is an arbitrarily long signed
+// decimal string and returns the parsed integers in the same order. Public
+// values may be echoed with the parser's detailed reason; private values are
+// never quoted, and their failure is described structurally (see
+// signedDecimalKind) with a 1-based index.
+func parseDecimalValues(values []string, which string, echo bool) ([]*big.Int, error) {
+	parsed := make([]*big.Int, len(values))
 	for i, v := range values {
-		if _, err := parseBigSignedDecimal(v); err != nil {
+		n, err := parseBigSignedDecimal(v)
+		if err != nil {
 			if echo {
-				return invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
+				return nil, invalidf("%s input #%d value %q is not a decimal integer: %v", which, i+1, v, err)
 			}
-			return invalidf("%s input #%d is not a decimal integer: %s", which, i+1, signedDecimalKind(v))
+			return nil, invalidf("%s input #%d is not a decimal integer: %s", which, i+1, signedDecimalKind(v))
 		}
+		parsed[i] = n
 	}
-	return nil
+	return parsed, nil
 }
 
 // evaluate checks every constraint against the witness and returns the
-// 1-based index of the first failure, or 0 when all hold.
+// 1-based index of the first failure, or 0 when all hold. It converts the
+// decimal strings itself; the check entry points instead validate and
+// convert once, then call evaluateChecked, so a checked input is never
+// parsed twice.
 func (d *canonicalDefinition) evaluate(w Witness) int {
-	p := d.modulus
-	// Wire layout: 0 = 1, then public inputs, then private inputs.
 	values := make([]int64, 1+d.public+d.private)
 	values[0] = 1
-	bigP := big.NewInt(p)
+	bigP := big.NewInt(d.modulus)
 	for i, s := range w.Public {
 		n, _ := parseBigSignedDecimal(s)
-		n.Mod(n, bigP)
-		values[1+i] = n.Int64()
+		values[1+i] = n.Mod(n, bigP).Int64()
 	}
 	for i, s := range w.Private {
 		n, _ := parseBigSignedDecimal(s)
-		n.Mod(n, bigP)
-		values[1+d.public+i] = n.Int64()
+		values[1+d.public+i] = n.Mod(n, bigP).Int64()
 	}
+	return d.evaluateValues(values)
+}
+
+// evaluateChecked is evaluate for an already-validated witness: the values
+// were converted from their decimal strings once during validation, so all
+// that remains here is reducing them into the field.
+func (d *canonicalDefinition) evaluateChecked(checked checkedWitness) int {
+	values := make([]int64, 1+d.public+d.private)
+	values[0] = 1
+	bigP := big.NewInt(d.modulus)
+	for i, n := range checked.public {
+		values[1+i] = new(big.Int).Mod(n, bigP).Int64()
+	}
+	for i, n := range checked.private {
+		values[1+d.public+i] = new(big.Int).Mod(n, bigP).Int64()
+	}
+	return d.evaluateValues(values)
+}
+
+// evaluateValues runs the a·b = c check over fully reduced wire values —
+// wire 0 is the constant 1, then the public inputs, then the private
+// inputs — and returns the 1-based index of the first failing constraint,
+// or 0 when every constraint holds.
+func (d *canonicalDefinition) evaluateValues(values []int64) int {
+	p := d.modulus
 	combo := func(terms []parsedTerm) int64 {
 		var sum int64
 		for _, t := range terms {

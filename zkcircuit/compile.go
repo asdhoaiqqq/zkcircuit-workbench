@@ -1,7 +1,6 @@
 package zkcircuit
 
 import (
-	"errors"
 	"fmt"
 	"os"
 )
@@ -172,10 +171,11 @@ func (s *Store) CheckInput(name string, version int, hash string, witness Witnes
 		if gerr != nil {
 			return gerr
 		}
-		if err := validateWitness(witness, def.public, def.private); err != nil {
-			return err
+		checked, verr := validateWitness(witness, def.public, def.private)
+		if verr != nil {
+			return verr
 		}
-		result = evaluateCheck(def, witness, boundHash)
+		result = evaluateCheck(def, checked, boundHash)
 		return nil
 	})
 	return result, err
@@ -206,11 +206,11 @@ func (s *Store) CheckInputFile(name string, version int, hash, path string) (Che
 		if gerr != nil {
 			return gerr
 		}
-		witness, werr := parseWitness(raw, def.public, def.private)
+		checked, werr := parseWitnessChecked(raw, def.public, def.private)
 		if werr != nil {
 			return werr
 		}
-		result = evaluateCheck(def, witness, boundHash)
+		result = evaluateCheck(def, checked, boundHash)
 		return nil
 	})
 	return result, err
@@ -264,23 +264,24 @@ func (s *Store) boundCheckDefinition(name string, version int, hash string) (*ca
 }
 
 // evaluateCheck runs the one shared verdict: the 1-based index of the first
-// failing constraint, or zero when every constraint holds.
-func evaluateCheck(def *canonicalDefinition, witness Witness, hash string) CheckResult {
-	failure := def.evaluate(witness)
+// failing constraint, or zero when every constraint holds. The witness
+// arrives already validated and converted, so no input string is parsed
+// here.
+func evaluateCheck(def *canonicalDefinition, checked checkedWitness, hash string) CheckResult {
+	failure := def.evaluateChecked(checked)
 	return CheckResult{Satisfied: failure == 0, Hash: hash, FirstFailure: failure}
 }
 
 // validateWitness applies the witness grammar and layout rules for an
-// in-API call and tags every rejection as an input format error.
-func validateWitness(w Witness, public, private int) error {
-	if _, err := witnessFromArrays(w.Public, w.Private, public, private); err != nil {
-		var se StoreError
-		if errors.As(err, &se) {
-			return StoreError{Kind: ErrInvalidInput.Kind, Detail: se.Detail}
-		}
-		return inputFormatf("%v", err)
+// in-API call, tags every rejection as an input format error, and returns
+// the converted values so evaluation reuses them instead of re-parsing the
+// decimal strings.
+func validateWitness(w Witness, public, private int) (checkedWitness, error) {
+	checked, err := witnessFromArrays(w.Public, w.Private, public, private)
+	if err != nil {
+		return checkedWitness{}, tagWitnessError(err)
 	}
-	return nil
+	return checked, nil
 }
 
 // --- lookup / mapping helpers ---------------------------------------------
