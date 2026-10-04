@@ -502,6 +502,14 @@ type persistJob struct {
 // string keeps being matched against the pinned version's artifact by
 // validateEnvelope, exactly as written.
 //
+// The field is recognized under any spelling that differs from compiled_hash
+// only in the case of English letters: COMPILED_HASH, Compiled_Hash and every
+// other ASCII case variant name the same binding and face the same string
+// validation. One job record may carry the binding field only once — a
+// lowercase key alongside an upper- or mixed-case key is a repeated binding
+// and is refused as corruption, never resolved by position or by whether the
+// two values agree.
+//
 // Only the binding field is judged here; every other field keeps the
 // ordinary struct decoding.
 func (j *persistJob) UnmarshalJSON(raw []byte) error {
@@ -521,25 +529,63 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 			where = fmt.Sprintf("stored job record %q", id)
 		}
 	}
+	// Find every member naming the binding field under any ASCII letter-case
+	// spelling. strictObjectMembers has already rejected the same exact key
+	// twice, so two hits here are always different case spellings of one
+	// logical field — a duplicate binding, not two fields to choose between.
+	var bindingRaw json.RawMessage
+	bindingKeys := 0
+	for key, value := range members {
+		if !equalASCIIFold(key, "compiled_hash") {
+			continue
+		}
+		bindingKeys++
+		bindingRaw = value
+	}
+	if bindingKeys > 1 {
+		return corruptf("%s carries the compiled-artifact binding field %q more than once under different case spellings", where, "compiled_hash")
+	}
 	compiledHash := ""
-	hasBinding := false
-	if hashRaw, present := members["compiled_hash"]; present {
-		hash, err := storedRecordShape.string(hashRaw, where+` field "compiled_hash"`)
+	if bindingKeys == 1 {
+		hash, err := storedRecordShape.string(bindingRaw, where+` field "compiled_hash"`)
 		if err != nil {
 			return err
 		}
-		compiledHash, hasBinding = hash, true
+		compiledHash = hash
 	}
 	type plainJob persistJob
 	var decoded plainJob
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return corruptf("%s is not valid JSON: %v", what, err)
 	}
-	if hasBinding {
-		decoded.CompiledHash = compiledHash
-	}
+	// The ordinary decode matches the binding key case-insensitively as well;
+	// only the validated value — or the genuine absence of the field — may
+	// survive into the stored record.
+	decoded.CompiledHash = compiledHash
 	*j = persistJob(decoded)
 	return nil
+}
+
+// equalASCIIFold reports whether a and b differ at most in the case of ASCII
+// letters. Unlike strings.EqualFold it folds no Unicode letters, so a stored
+// key matches the binding field only through English letter case.
+func equalASCIIFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 // Store is a persistent workbench backed by one local data directory.
