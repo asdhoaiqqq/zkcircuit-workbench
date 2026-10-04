@@ -38,7 +38,10 @@ const (
 // UnmarshalJSON — rather than encoding/json's silent zero-value filling —
 // decides what a committed circuit record may look like. UnmarshalJSON first
 // walks the token stream (scanEnvelopeDuplicates) and rejects a repeated
-// object key anywhere encoding/json would otherwise keep the last value.
+// object key anywhere encoding/json would otherwise keep the last value —
+// including a top-level field repeated under a different letter-case
+// spelling, which the decoder's own case-insensitive key matching would
+// otherwise merge silently.
 type envelope struct {
 	Format    int               `json:"format"`
 	Circuits  []persistCircuit  `json:"circuits"`
@@ -99,13 +102,60 @@ func (e *envelope) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// topLevelFields are the envelope's five recognized members. Letter-case
+// variants of these names denote the same field: "circuits", "CIRCUITS" and
+// every mixed-case or JSON-escaped spelling are one field, so the envelope
+// may carry each of them at most once however it is capitalized.
+var topLevelFields = []string{"format", "circuits", "setups", "jobs", "artifacts"}
+
+// canonicalTopLevelField maps an envelope member name to the standard
+// lowercase field it denotes, allowing differences in ASCII letter case
+// only. Keys are already JSON-unescaped at this point, so an escaped
+// spelling of any of these forms lands here too. Names that are not one of
+// the five known fields — in any case — report false, and non-ASCII
+// lookalikes never match.
+func canonicalTopLevelField(key string) (string, bool) {
+	for _, field := range topLevelFields {
+		if equalFoldASCII(key, field) {
+			return field, true
+		}
+	}
+	return "", false
+}
+
+// equalFoldASCII reports whether a and b differ at most in ASCII letter
+// case; bytes outside A-Z/a-z must match exactly.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // scanEnvelopeDuplicates tokenizes the committed envelope and rejects every
-// repeated object key. Circuit records are scanned one level deep only —
-// their top-level fields are checked here (with the record's 1-based index
-// reported), while values such as the constraint definition are skipped and
-// left to their own strict decoders. Every other envelope member is scanned
-// recursively so a duplicated key anywhere in committed data fails the read
-// instead of silently resolving to its last value.
+// repeated object key. At the top level the five known fields are compared
+// case-insensitively (after JSON unescaping), so "circuits" followed by
+// "CIRCUITS" is the same duplicate as two identical spellings — in any order
+// and whether or not the two values agree — and refuses the read instead of
+// letting the later array replace the earlier one. Circuit records are
+// scanned one level deep only — their top-level fields are checked here
+// (with the record's 1-based index reported), while values such as the
+// constraint definition are skipped and left to their own strict decoders.
+// Every other envelope member is scanned recursively so a duplicated key
+// anywhere in committed data fails the read instead of silently resolving to
+// its last value.
 func scanEnvelopeDuplicates(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
 	dec.UseNumber()
@@ -123,11 +173,22 @@ func scanEnvelopeDuplicates(raw []byte) error {
 		if !ok {
 			return corruptf("data file envelope is not valid JSON")
 		}
-		if seenTop[key] {
+		// Known fields are tracked under their canonical lowercase name so a
+		// case-variant spelling of the same field is still a duplicate;
+		// unrecognized fields keep exact-spelling tracking only.
+		seenKey := key
+		canonical, known := canonicalTopLevelField(key)
+		if known {
+			seenKey = canonical
+		}
+		if seenTop[seenKey] {
+			if known {
+				return corruptf("data file envelope contains duplicate top-level field %q (standard field name %q)", key, canonical)
+			}
 			return corruptf("data file envelope contains duplicate field %q", key)
 		}
-		seenTop[key] = true
-		if key == "circuits" {
+		seenTop[seenKey] = true
+		if known && canonical == "circuits" {
 			if err := scanCircuitArrayDuplicates(dec); err != nil {
 				return err
 			}
@@ -497,19 +558,7 @@ const compiledHashKey = "compiled_hash"
 // already JSON-unescaped at this point, so an escaped spelling of any of
 // these forms lands here too. Non-ASCII lookalikes never match.
 func isCompiledHashKey(key string) bool {
-	if len(key) != len(compiledHashKey) {
-		return false
-	}
-	for i := 0; i < len(key); i++ {
-		c := key[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		if c != compiledHashKey[i] {
-			return false
-		}
-	}
-	return true
+	return equalFoldASCII(key, compiledHashKey)
 }
 
 // Strict decoding of the compiled-artifact binding on a committed job record.
