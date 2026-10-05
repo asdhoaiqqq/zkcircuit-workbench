@@ -707,10 +707,28 @@ type Store struct {
 // and fully validated before Open returns; on a corrupt, truncated or
 // unsupported-format file Open returns an error wrapping ErrDataCorrupt and
 // leaves every file in the directory untouched.
+//
+// dir is resolved against the process's current working directory at Open
+// time and pinned for the store's lifetime: a relative path such as
+// "bench-data" names one fixed directory from the moment Open succeeds, and
+// later working-directory changes never redirect the store's reads, writes,
+// lock or Dir to another location. Paths to constraint definitions and input
+// files passed to individual operations are not pinned this way — they keep
+// being resolved against the caller's working directory at call time.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, invalidf("data directory must not be empty")
 	}
+	// Pin the location now: a relative path would otherwise be re-resolved
+	// against the process working directory on every later file access, so a
+	// chdir after Open could silently move the store onto a different
+	// bench-data. Abs (not EvalSymlinks) so a not-yet-existing directory can
+	// still be created below.
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
+	}
+	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create data directory %q: %w", dir, err)
 	}
