@@ -35,6 +35,18 @@ import (
 // (prime modulus, constraint count, wire layout, coefficient grammar) are
 // likewise shared: they live in definitionShape.canonicalize and run after
 // this structural decode on both paths.
+//
+// One scan, not three. The document is tokenized a single time into the
+// jvalue tree: syntax is checked by the one leading json.Unmarshal and the
+// tree walk accounts for every object member exactly once, so a repeated key
+// nested many levels deep is seen during that one descent instead of once per
+// enclosing object. The outer definition, every constraint and every term all
+// take their members from the same tree; nothing is re-unmarshaled or
+// re-walked per level. The order in which findings are surfaced is fixed
+// exactly as it was before the consolidation: syntax first, then an unknown
+// top-level field, then the first repeated key anywhere in the document (a
+// document-level finding, never attributed to one constraint), and only then
+// the level-by-level shape and type checks.
 
 // jsonShape is the strict-JSON rule set the definition schema is built from:
 // objects name only allowed keys, required members are present, scalars have
@@ -47,90 +59,279 @@ type jsonShape struct {
 	nullSuffix string
 }
 
-// object decodes raw as a JSON object whose keys must all be allowed,
-// rejecting syntax errors, trailing data, duplicates, non-objects and
-// unknown keys. It returns the raw members for typed decoding.
-func (s jsonShape) object(raw []byte, allowed []string, what string) (map[string]json.RawMessage, error) {
+// jvalue is one JSON value as found during the single structural tokenization
+// pass. Objects keep their members in document order; raw is the value's own
+// byte span within the document (the key text excluded), which the later
+// typed reads slice directly instead of re-decoding the surrounding document.
+// A null member is represented by kind == jnull; scalar leaves carry their
+// json token already decoded (string/number/bool), so scalar type checks need
+// no second parse to *decide the type* — only the error text of a rejected
+// scalar goes through json.Unmarshal, keeping the diagnostic byte-identical.
+type jvalue struct {
+	kind    byte // '{', '[', 's' string, 'n' number, 'b' bool, '0' null
+	raw     []byte
+	str     string
+	boolean bool
+	members []jmember
+	items   []*jvalue
+}
+
+// jmember is one object value paired with its already-JSON-unescaped key.
+type jmember struct {
+	key   string
+	value *jvalue
+}
+
+// documentBuilder is the state of the one structural tokenization: it owns
+// the decoder and remembers the first repeated key in token order while the
+// whole document is still walked, so an unknown top-level field encountered
+// later in the document is allowed to win over a deeper duplicate, exactly as
+// the unmarshal-then-walk ordering did before consolidation.
+type documentBuilder struct {
+	shape  jsonShape
+	dec    *json.Decoder
+	doc    []byte
+	what   string
+	dupErr error // first duplicate field, surfaced only after the top scan
+}
+
+// valueStartAfterKey returns the offset at which an object member's value
+// begins: after a key token the decoder is positioned at the colon, so skip
+// the colon and surrounding JSON whitespace. The leading grammar pass already
+// proved a colon and value follow, so the scan is exact.
+func (b *documentBuilder) valueStartAfterKey() int64 {
+	i := b.dec.InputOffset()
+	isSpace := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	for i < int64(len(b.doc)) && isSpace(b.doc[i]) {
+		i++
+	}
+	if i < int64(len(b.doc)) && b.doc[i] == ':' {
+		i++
+	}
+	for i < int64(len(b.doc)) && isSpace(b.doc[i]) {
+		i++
+	}
+	return i
+}
+
+// parseJValue decodes the complete JSON value the decoder is positioned at,
+// tracking the raw span and, for objects, recording a repeated member key.
+// Keys are compared after JSON unescaping (the decoder already unescapes the
+// key token), so a key repeated through a \uXXXX spelling is a duplicate even
+// when both values are byte-identical. Every token of the document is visited
+// exactly once in this single descent; a duplicate does not stop the walk, so
+// every top-level member is still seen before any finding is surfaced.
+func (b *documentBuilder) parseJValue(start int64) (*jvalue, error) {
+	tok, err := b.dec.Token()
+	if err != nil {
+		return nil, b.shape.fail("%s is not valid JSON: %v", b.what, err)
+	}
+	switch v := tok.(type) {
+	case json.Delim:
+		switch v {
+		case '{':
+			out := &jvalue{kind: '{'}
+			seen := make(map[string]bool)
+			for b.dec.More() {
+				keyTok, err := b.dec.Token()
+				if err != nil {
+					return nil, b.shape.fail("%s is not valid JSON: %v", b.what, err)
+				}
+				key := keyTok.(string)
+				if seen[key] && b.dupErr == nil {
+					b.dupErr = b.shape.fail("%s contains duplicate field %q", b.what, key)
+				}
+				seen[key] = true
+				child, err := b.parseJValue(b.valueStartAfterKey())
+				if err != nil {
+					return nil, err
+				}
+				out.members = append(out.members, jmember{key: key, value: child})
+			}
+			if _, err := b.dec.Token(); err != nil { // closing brace
+				return nil, b.shape.fail("%s is not valid JSON: %v", b.what, err)
+			}
+			out.raw = b.doc[start:b.dec.InputOffset()]
+			return out, nil
+		case '[':
+			out := &jvalue{kind: '['}
+			for b.dec.More() {
+				child, err := b.parseJValue(b.dec.InputOffset())
+				if err != nil {
+					return nil, err
+				}
+				out.items = append(out.items, child)
+			}
+			if _, err := b.dec.Token(); err != nil { // closing bracket
+				return nil, b.shape.fail("%s is not valid JSON: %v", b.what, err)
+			}
+			out.raw = b.doc[start:b.dec.InputOffset()]
+			return out, nil
+		}
+	case string:
+		return &jvalue{kind: 's', raw: b.doc[start:b.dec.InputOffset()], str: v}, nil
+	case json.Number:
+		return &jvalue{kind: 'n', raw: b.doc[start:b.dec.InputOffset()]}, nil
+	case bool:
+		return &jvalue{kind: 'b', raw: b.doc[start:b.dec.InputOffset()], boolean: v}, nil
+	case nil:
+		return &jvalue{kind: '0', raw: b.doc[start:b.dec.InputOffset()]}, nil
+	}
+	return nil, b.shape.fail("%s is not valid JSON", b.what)
+}
+
+// buildDocumentTree applies the object-shape gate, then one grammar pass, then
+// one whole-document walk, returning the value tree and the first repeated
+// key found. The gate and the grammar pass reproduce the original object()
+// precedence exactly: a null document is named as such, a document that does
+// not start with '{' (an empty input, an array, a scalar) is "must be a JSON
+// object" without a grammar parse, and only an object candidate is fully
+// parsed, which also rejects trailing data after the single top-level value.
+//
+// The walk is the single place a repeated object key is detected at any
+// depth. The what argument names the whole document: a duplicate nested in a
+// constraint or a term is, as before, a document-level finding rather than a
+// per-constraint one. dupErr is deferred: the caller checks the top-level
+// field set first, so an unknown top-level field still outranks a deeper
+// duplicate.
+func (s jsonShape) buildDocumentTree(raw []byte, what string) (root *jvalue, dupErr error, err error) {
 	trimmed := bytes.TrimSpace(raw)
 	if string(trimmed) == "null" {
-		return nil, s.fail("%s must be a JSON object%s", what, s.nullSuffix)
+		return nil, nil, s.fail("%s must be a JSON object%s", what, s.nullSuffix)
 	}
 	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, nil, s.fail("%s must be a JSON object", what)
+	}
+	// One grammar pass over the whole document before any member is judged:
+	// json.Unmarshal also rejects trailing data after the top-level value,
+	// including a second complete value, with its own wording.
+	var head json.RawMessage
+	if err := json.Unmarshal(trimmed, &head); err != nil {
+		return nil, nil, s.fail("%s is not valid JSON: %v", what, err)
+	}
+	b := &documentBuilder{
+		shape: s,
+		dec:   json.NewDecoder(bytes.NewReader(trimmed)),
+		doc:   trimmed,
+		what:  what,
+	}
+	b.dec.UseNumber()
+	vroot, err := b.parseJValue(0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return vroot, b.dupErr, nil
+}
+
+// member looks up a named member of an object value.
+func (v *jvalue) member(key string) (*jvalue, bool) {
+	for i := range v.members {
+		if v.members[i].key == key {
+			return v.members[i].value, true
+		}
+	}
+	return nil, false
+}
+
+// requireObject rejects anything that is not an object (null included) and
+// returns the value. The nullSuffix distinguishes the committed-data wording
+// ("…, not null") from the import wording, which simply names the shape.
+func (s jsonShape) requireObject(v *jvalue, what string) (*jvalue, error) {
+	if v == nil || v.kind != '{' {
+		if v != nil && v.kind == '0' {
+			return nil, s.fail("%s must be a JSON object%s", what, s.nullSuffix)
+		}
 		return nil, s.fail("%s must be a JSON object", what)
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &members); err != nil {
-		// Unmarshal also rejects trailing data after the top-level value.
-		return nil, s.fail("%s is not valid JSON: %v", what, err)
-	}
+	return v, nil
+}
+
+// allowOnlyMembers rejects an object carrying any key outside allowed. It
+// inspects only this object's own level; nested objects are judged when their
+// own level is read.
+func (s jsonShape) allowOnlyMembers(v *jvalue, allowed []string, what string) error {
 	allowedSet := make(map[string]bool, len(allowed))
 	for _, k := range allowed {
 		allowedSet[k] = true
 	}
-	for key := range members {
-		if !allowedSet[key] {
-			return nil, s.fail("%s has unknown field %q", what, key)
+	for _, m := range v.members {
+		if !allowedSet[m.key] {
+			return s.fail("%s has unknown field %q", what, m.key)
 		}
 	}
-	if err := s.rejectDuplicates(trimmed, what); err != nil {
-		return nil, err
-	}
-	return members, nil
+	return nil
 }
 
-// rejectDuplicates walks the JSON token stream rejecting any object that
-// names the same key twice; encoding/json silently keeps the last value.
-// Keys are compared after JSON unescaping, so a key repeated through a
-// \uXXXX spelling is still a duplicate, even when both values are identical.
-func (s jsonShape) rejectDuplicates(raw []byte, what string) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var walk func() error
-	walk = func() error {
-		tok, err := dec.Token()
-		if err != nil {
-			return s.fail("%s is not valid JSON: %v", what, err)
-		}
-		delim, ok := tok.(json.Delim)
-		if !ok {
-			return nil // scalar
-		}
-		switch delim {
-		case '{':
-			seen := make(map[string]bool)
-			for dec.More() {
-				keyTok, err := dec.Token()
-				if err != nil {
-					return s.fail("%s is not valid JSON: %v", what, err)
-				}
-				key := keyTok.(string)
-				if seen[key] {
-					return s.fail("%s contains duplicate field %q", what, key)
-				}
-				seen[key] = true
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			if _, err := dec.Token(); err != nil { // closing brace
-				return s.fail("%s is not valid JSON: %v", what, err)
-			}
-		case '[':
-			for dec.More() {
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			if _, err := dec.Token(); err != nil { // closing bracket
-				return s.fail("%s is not valid JSON: %v", what, err)
-			}
-		}
-		return nil
+// requiredMember returns a required member of an object value from the
+// single-pass tree.
+func (s jsonShape) requiredMember(v *jvalue, key, what string) (*jvalue, error) {
+	m, ok := v.member(key)
+	if !ok {
+		return nil, s.fail("%s is missing required field %q", what, key)
 	}
-	return walk()
+	return m, nil
 }
 
-// require returns the raw value of a required member.
+// arrayElements requires v to be an array and returns its element values.
+// Null is rejected: a required array must be provided explicitly, even when
+// empty. A wrongly typed value keeps its unmarshal error text.
+func (s jsonShape) arrayElements(v *jvalue, what string) ([]*jvalue, error) {
+	if v.kind == '0' {
+		return nil, s.fail("%s must be an array%s", what, s.nullSuffix)
+	}
+	if v.kind != '[' {
+		var elements []json.RawMessage
+		if err := json.Unmarshal(v.raw, &elements); err != nil {
+			return nil, s.fail("%s must be an array: %v", what, err)
+		}
+	}
+	return v.items, nil
+}
+
+// string requires a JSON string and returns it.
+func (s jsonShape) stringValue(v *jvalue, what string) (string, error) {
+	if v.kind == 's' {
+		return v.str, nil
+	}
+	if v.kind == '0' {
+		return "", s.fail("%s must be a JSON string, not null", what)
+	}
+	var out string
+	if err := json.Unmarshal(v.raw, &out); err != nil {
+		return "", s.fail("%s must be a JSON string: %v", what, err)
+	}
+	return out, nil
+}
+
+// int requires a JSON integer (no floats, strings, null, booleans).
+func (s jsonShape) intValue(v *jvalue, what string) (int, error) {
+	if v.kind == '0' {
+		return 0, s.fail("%s must be a JSON integer, not null", what)
+	}
+	if v.kind == 'n' {
+		var n int
+		if err := json.Unmarshal(v.raw, &n); err != nil {
+			return 0, s.fail("%s must be a JSON integer: %v", what, err)
+		}
+		return n, nil
+	}
+	var n int
+	if err := json.Unmarshal(v.raw, &n); err != nil {
+		return 0, s.fail("%s must be a JSON integer", what)
+	}
+	return n, nil
+}
+
+// ---- raw-member helpers for the committed record decoders -----------------
+//
+// The circuit and job records in data.json are decoded member-by-member from
+// a json.RawMessage map (see strictObjectMembers in store.go), one level per
+// record with the values left to their own decoders. These four helpers read
+// one such already-isolated raw member: a required lookup and the strict
+// string/integer/boolean scalars. They share the jsonShape error tagging but
+// operate on raw members rather than the definition document tree.
+
+// requireRaw returns the raw value of a required member.
 func (s jsonShape) require(members map[string]json.RawMessage, key, what string) (json.RawMessage, error) {
 	raw, ok := members[key]
 	if !ok {
@@ -139,20 +340,7 @@ func (s jsonShape) require(members map[string]json.RawMessage, key, what string)
 	return raw, nil
 }
 
-// array requires raw to be a JSON array and returns its raw elements. Null
-// is rejected: a required array must be provided explicitly, even when empty.
-func (s jsonShape) array(raw json.RawMessage, what string) ([]json.RawMessage, error) {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return nil, s.fail("%s must be an array%s", what, s.nullSuffix)
-	}
-	var elements []json.RawMessage
-	if err := json.Unmarshal(raw, &elements); err != nil {
-		return nil, s.fail("%s must be an array: %v", what, err)
-	}
-	return elements, nil
-}
-
-// string requires raw to be a JSON string and returns it.
+// string decodes a raw required member as a JSON string.
 func (s jsonShape) string(raw json.RawMessage, what string) (string, error) {
 	if string(bytes.TrimSpace(raw)) == "null" {
 		return "", s.fail("%s must be a JSON string, not null", what)
@@ -164,7 +352,8 @@ func (s jsonShape) string(raw json.RawMessage, what string) (string, error) {
 	return v, nil
 }
 
-// int requires raw to be a JSON integer (no floats, strings, null).
+// int decodes a raw required member as a JSON integer (no floats, strings,
+// null).
 func (s jsonShape) int(raw json.RawMessage, what string) (int, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if string(trimmed) == "null" || len(trimmed) == 0 {
@@ -180,8 +369,8 @@ func (s jsonShape) int(raw json.RawMessage, what string) (int, error) {
 	return n, nil
 }
 
-// bool requires raw to be a JSON boolean (true/false; not null, a number or
-// a string).
+// bool decodes a raw required member as a JSON boolean (true/false; not null,
+// a number or a string).
 func (s jsonShape) bool(raw json.RawMessage, what string) (bool, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if string(trimmed) == "true" {
@@ -266,33 +455,47 @@ var storedDefinitionSource = definitionShapeSource{
 // definition document: exactly the modulus and constraints fields at the top
 // level, exactly the a/b/c arrays per constraint and exactly the wire/coeff
 // pair per term, each present, non-null and correctly typed.
+//
+// The document is tokenized once into a tree, and that one tree answers every
+// level. Findings surface in the fixed order grammar/shape gate → unknown
+// top-level field → repeated key anywhere → level-by-level required-field and
+// type checks.
 func decodeDefinitionShape(raw []byte, src definitionShapeSource) (definitionShape, error) {
-	members, err := src.shape.object(raw, []string{"modulus", "constraints"}, src.definition)
+	obj, dupErr, err := src.shape.buildDocumentTree(raw, src.definition)
 	if err != nil {
 		return definitionShape{}, err
 	}
-	modulusRaw, err := src.shape.require(members, "modulus", src.definition)
+	// buildDocumentTree has already enforced the object gate, so obj is an
+	// object here. An unknown top-level field outranks a deeper duplicate;
+	// only afterwards is the first repeated key anywhere surfaced.
+	if err := src.shape.allowOnlyMembers(obj, []string{"modulus", "constraints"}, src.definition); err != nil {
+		return definitionShape{}, err
+	}
+	if dupErr != nil {
+		return definitionShape{}, dupErr
+	}
+	modulusRaw, err := src.shape.requiredMember(obj, "modulus", src.definition)
 	if err != nil {
 		return definitionShape{}, err
 	}
-	constraintsRaw, err := src.shape.require(members, "constraints", src.definition)
+	constraintsRaw, err := src.shape.requiredMember(obj, "constraints", src.definition)
 	if err != nil {
 		return definitionShape{}, err
 	}
-	modulusText, err := src.shape.string(modulusRaw, src.modulus)
+	modulusText, err := src.shape.stringValue(modulusRaw, src.modulus)
 	if err != nil {
 		return definitionShape{}, err
 	}
-	constraintRaws, err := src.shape.array(constraintsRaw, src.definition+` field "constraints"`)
+	constraintValues, err := src.shape.arrayElements(constraintsRaw, src.definition+` field "constraints"`)
 	if err != nil {
 		return definitionShape{}, err
 	}
 	out := definitionShape{
 		modulus:     modulusText,
-		constraints: make([]constraintShape, 0, len(constraintRaws)),
+		constraints: make([]constraintShape, 0, len(constraintValues)),
 	}
-	for i, craw := range constraintRaws {
-		con, err := decodeConstraintShape(craw, src)
+	for i, cval := range constraintValues {
+		con, err := decodeConstraintValue(cval, src)
 		if err != nil {
 			if src.wrapConstraint != nil {
 				return definitionShape{}, src.wrapConstraint(i, err)
@@ -304,10 +507,14 @@ func decodeDefinitionShape(raw []byte, src definitionShapeSource) (definitionSha
 	return out, nil
 }
 
-// decodeConstraintShape decodes one {"a":[…],"b":[…],"c":[…]} object.
-func decodeConstraintShape(raw json.RawMessage, src definitionShapeSource) (constraintShape, error) {
-	members, err := src.shape.object(raw, []string{"a", "b", "c"}, src.constraint)
+// decodeConstraintValue decodes one {"a":[…],"b":[…],"c":[…]} value taken
+// from the shared tree.
+func decodeConstraintValue(v *jvalue, src definitionShapeSource) (constraintShape, error) {
+	obj, err := src.shape.requireObject(v, src.constraint)
 	if err != nil {
+		return constraintShape{}, err
+	}
+	if err := src.shape.allowOnlyMembers(obj, []string{"a", "b", "c"}, src.constraint); err != nil {
 		return constraintShape{}, err
 	}
 	var out constraintShape
@@ -317,11 +524,11 @@ func decodeConstraintShape(raw json.RawMessage, src definitionShapeSource) (cons
 	}{
 		{"a", &out.a}, {"b", &out.b}, {"c", &out.c},
 	} {
-		sideRaw, err := src.shape.require(members, side.key, src.constraint)
+		sideRaw, err := src.shape.requiredMember(obj, side.key, src.constraint)
 		if err != nil {
 			return constraintShape{}, err
 		}
-		terms, err := decodeTermArray(sideRaw, src, side.key)
+		terms, err := decodeTermArrayValue(sideRaw, src, side.key)
 		if err != nil {
 			return constraintShape{}, err
 		}
@@ -330,16 +537,16 @@ func decodeConstraintShape(raw json.RawMessage, src definitionShapeSource) (cons
 	return out, nil
 }
 
-// decodeTermArray decodes one a/b/c side: an explicit array (possibly empty)
-// of term objects.
-func decodeTermArray(raw json.RawMessage, src definitionShapeSource, side string) ([]termShape, error) {
-	termRaws, err := src.shape.array(raw, fmt.Sprintf("%s side %q", src.constraint, side))
+// decodeTermArrayValue decodes one a/b/c side: an explicit array (possibly
+// empty) of term objects, read from the shared tree.
+func decodeTermArrayValue(v *jvalue, src definitionShapeSource, side string) ([]termShape, error) {
+	termValues, err := src.shape.arrayElements(v, fmt.Sprintf("%s side %q", src.constraint, side))
 	if err != nil {
 		return nil, err
 	}
-	terms := make([]termShape, 0, len(termRaws))
-	for j, traw := range termRaws {
-		term, err := decodeTermShape(traw, src, side, j)
+	terms := make([]termShape, 0, len(termValues))
+	for j, tval := range termValues {
+		term, err := decodeTermValue(tval, src, side, j)
 		if err != nil {
 			return nil, err
 		}
@@ -348,26 +555,30 @@ func decodeTermArray(raw json.RawMessage, src definitionShapeSource, side string
 	return terms, nil
 }
 
-// decodeTermShape decodes one {"wire":int,"coeff":string} object.
-func decodeTermShape(raw json.RawMessage, src definitionShapeSource, side string, index int) (termShape, error) {
+// decodeTermValue decodes one {"wire":int,"coeff":string} value taken from
+// the shared tree.
+func decodeTermValue(v *jvalue, src definitionShapeSource, side string, index int) (termShape, error) {
 	what := src.term(side, index)
-	members, err := src.shape.object(raw, []string{"wire", "coeff"}, what)
+	obj, err := src.shape.requireObject(v, what)
 	if err != nil {
 		return termShape{}, err
 	}
-	wireRaw, err := src.shape.require(members, "wire", what)
+	if err := src.shape.allowOnlyMembers(obj, []string{"wire", "coeff"}, what); err != nil {
+		return termShape{}, err
+	}
+	wireRaw, err := src.shape.requiredMember(obj, "wire", what)
 	if err != nil {
 		return termShape{}, err
 	}
-	coeffRaw, err := src.shape.require(members, "coeff", what)
+	coeffRaw, err := src.shape.requiredMember(obj, "coeff", what)
 	if err != nil {
 		return termShape{}, err
 	}
-	wire, err := src.shape.int(wireRaw, what+" wire")
+	wire, err := src.shape.intValue(wireRaw, what+" wire")
 	if err != nil {
 		return termShape{}, err
 	}
-	coeff, err := src.shape.string(coeffRaw, what+" coefficient")
+	coeff, err := src.shape.stringValue(coeffRaw, what+" coefficient")
 	if err != nil {
 		return termShape{}, err
 	}
