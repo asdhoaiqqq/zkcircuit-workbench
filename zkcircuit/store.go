@@ -403,7 +403,7 @@ func scanJobArrayDuplicates(dec *json.Decoder) error {
 					id = idVal
 				}
 			}
-			if strings.EqualFold(key, jobVersionKey) {
+			if isJobVersionKey(key) {
 				versionKeys = append(versionKeys, key)
 			}
 			if seenExact[key] && dupKey == "" {
@@ -425,14 +425,8 @@ func scanJobArrayDuplicates(dec *json.Decoder) error {
 		}
 		// A repeated version spelling is the pinned-version ambiguity and gets
 		// the specific message, including when both keys are byte-identical.
-		if len(versionKeys) > 1 {
-			sort.Strings(versionKeys)
-			quoted := make([]string, len(versionKeys))
-			for i, k := range versionKeys {
-				quoted[i] = strconv.Quote(k)
-			}
-			return corruptf("%s carries the pinned version field %q more than once (as %s)",
-				what, jobVersionKey, strings.Join(quoted, ", "))
+		if err := jobVersionAmbiguityErr(what, versionKeys); err != nil {
+			return err
 		}
 		if dupKey != "" {
 			return corruptf("%s contains duplicate field %q", what, dupKey)
@@ -770,6 +764,46 @@ func isCompiledHashKey(key string) bool {
 // trusted setup and compiled artifact — the job belongs to.
 const jobVersionKey = "version"
 
+// isJobVersionKey reports whether key names the job's pinned circuit version
+// field under any spelling the ordinary struct decode would fill Version
+// from: canonical "version", an ASCII letter-case variant ("VERSION",
+// "VeRsIoN", …), and — because encoding/json's struct-tag matching folds
+// with Unicode case rules — the long-s "verſion" (U+017F). Keys are compared
+// after JSON unescaping, so a spelling produced by a \uXXXX escape lands here
+// too. This one recognition rule is shared by the directory read
+// (scanJobArrayDuplicates) and the single-record decode
+// (persistJob.UnmarshalJSON) so the two can never drift apart on what counts
+// as the version field.
+func isJobVersionKey(key string) bool {
+	return strings.EqualFold(key, jobVersionKey)
+}
+
+// jobVersionAmbiguityErr is the single pinned-version uniqueness rule shared
+// by the directory read (scanJobArrayDuplicates) and the single-record decode
+// (persistJob.UnmarshalJSON). Every spelling isJobVersionKey recognizes is
+// the same version field, so two of them on one job record make the bound
+// version — and with it the frozen circuit, trusted setup and compiled
+// artifact the job belongs to — depend on key order (encoding/json keeps the
+// last value). The record is refused however the two values relate (equal or
+// differing, both legal) and however the keys are interleaved with unrelated
+// fields. spellings are the record's member keys already recognized by
+// isJobVersionKey, in any order; they are sorted so the message is stable.
+// where locates the record the way the calling read context does (the job id
+// when known, else the reader's own fallback label). Zero or one spelling is
+// not ambiguous and returns nil.
+func jobVersionAmbiguityErr(where string, spellings []string) error {
+	if len(spellings) < 2 {
+		return nil
+	}
+	sort.Strings(spellings)
+	quoted := make([]string, len(spellings))
+	for i, k := range spellings {
+		quoted[i] = strconv.Quote(k)
+	}
+	return corruptf("%s carries the pinned version field %q more than once (as %s)",
+		where, jobVersionKey, strings.Join(quoted, ", "))
+}
+
 // compiledHashLookalike reports a member key encoding/json would match onto
 // the binding field's struct tag yet which is not an accepted ASCII spelling
 // (isCompiledHashKey). Struct-tag matching in encoding/json folds with the
@@ -882,34 +916,26 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 			where, compiledHashKey, alias)
 	}
 	// Every spelling the ordinary read below would fill Version from is one
-	// version field: canonical "version", an ASCII letter-case variant, or a
-	// JSON-escaped spelling that unescapes onto either — and, because
-	// encoding/json's struct-tag matching folds with Unicode case rules
-	// (strings.EqualFold), the long-s "verſion" (U+017F, direct or u017f-
-	// escaped) too. The pinned version selects the frozen circuit, its trusted
-	// setup and its artifact, so a record carrying two such spellings is
-	// ambiguous: encoding/json keeps the last value, which would let the
-	// binding flip depending on key order (or let an unhashed job read against
-	// a different frozen, set-up version). Whatever the two values are — equal
-	// or different, both legal — and even with unrelated fields interleaved
-	// between them, the whole record is refused rather than resolved by order.
-	// A long-s spelling counts here only beside another recognized spelling;
-	// standing alone it is the single version field and keeps the current
-	// reading handled below.
+	// version field — the recognition and the duplicate verdict are the shared
+	// rule in isJobVersionKey and jobVersionAmbiguityErr, also applied by the
+	// directory read before this decoder runs. The pinned version selects the
+	// frozen circuit, its trusted setup and its artifact, so a record carrying
+	// two such spellings is ambiguous: encoding/json keeps the last value,
+	// which would let the binding flip depending on key order (or let an
+	// unhashed job read against a different frozen, set-up version). Whatever
+	// the two values are — equal or different, both legal — and even with
+	// unrelated fields interleaved between them, the whole record is refused
+	// rather than resolved by order. A long-s spelling counts here only beside
+	// another recognized spelling; standing alone it is the single version
+	// field and keeps the current reading handled below.
 	var versionKeys []string
 	for key := range members {
-		if strings.EqualFold(key, jobVersionKey) {
+		if isJobVersionKey(key) {
 			versionKeys = append(versionKeys, key)
 		}
 	}
-	if len(versionKeys) > 1 {
-		sort.Strings(versionKeys)
-		quoted := make([]string, len(versionKeys))
-		for i, k := range versionKeys {
-			quoted[i] = strconv.Quote(k)
-		}
-		return corruptf("%s carries the pinned version field %q more than once (as %s)",
-			where, jobVersionKey, strings.Join(quoted, ", "))
+	if err := jobVersionAmbiguityErr(where, versionKeys); err != nil {
+		return err
 	}
 	// With zero or one recognized spelling, the ordinary decode below already
 	// yields the current value: a single canonical/ASCII/long-s spelling folds
