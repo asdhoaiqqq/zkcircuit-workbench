@@ -372,7 +372,14 @@ func (s *Store) RecordSetup(name string, version int) (Setup, error) {
 // SubmitJob accepts and stores a prove job. Only kind "prove" is accepted;
 // no proving computation runs, the accepted request alone is persisted.
 //
-// The job id must be non-empty and not only whitespace, circuit name and
+// The job id must be non-empty and not only whitespace and must be complete,
+// valid UTF-8: the id is the job's identity and is looked up by exact value,
+// and encoding/json silently rewrites invalid byte sequences (a lone
+// continuation byte, a truncated multi-byte character, an encoded surrogate
+// half, …) to U+FFFD when the record is marshaled, so accepting them would
+// save the job under a different id than the caller submitted (and could
+// collide with an id that genuinely contains "�"). Such a request is refused
+// as ErrInvalidArgument before anything is committed. Circuit name and
 // version must be explicit and Attempt must be positive. Failure reasons are
 // distinguishable: ErrNotFound (version unknown), ErrNotFrozen (version is
 // still a draft) and ErrSetupMissing (no trusted setup for that version). A
@@ -393,6 +400,9 @@ func (s *Store) RecordSetup(name string, version int) (Setup, error) {
 func (s *Store) SubmitJob(job Job) (Job, error) {
 	if strings.TrimSpace(job.ID) == "" {
 		return Job{}, invalidf("job id must be non-empty and not only whitespace")
+	}
+	if !utf8.ValidString(job.ID) {
+		return Job{}, invalidf("job id must be valid UTF-8: the submitted id contains invalid byte sequences (a lone continuation byte or a truncated multi-byte character) that would be rewritten to a replacement character when saved")
 	}
 	if strings.TrimSpace(job.Circuit) == "" {
 		return Job{}, invalidf("job %q must name a circuit", job.ID)
