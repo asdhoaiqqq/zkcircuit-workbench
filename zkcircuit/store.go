@@ -242,6 +242,12 @@ func scanEnvelopeDuplicates(raw []byte) error {
 				}
 				continue
 			}
+			if canonical == "jobs" {
+				if err := scanJobArrayDuplicates(dec); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := skipValueWithDupKeys(dec, "data file envelope field "+strconv.Quote(canonical)); err != nil {
 				return err
 			}
@@ -321,6 +327,122 @@ func scanCircuitArrayDuplicates(dec *json.Decoder) error {
 	}
 	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
 		return corruptf("data file envelope field \"circuits\" is not valid JSON")
+	}
+	return nil
+}
+
+// scanJobArrayDuplicates consumes one "jobs" value positioned at its opening
+// bracket. It is the jobs-array counterpart of scanCircuitArrayDuplicates and
+// exists so a structural problem inside one job is attributed to that job — by
+// its id when the id is a legible string, else by its 1-based position —
+// rather than to an opaque "jobs" element index.
+//
+// Besides an exact repeated member key (compared after JSON unescaping, as for
+// every other record), it enforces the pinned-version uniqueness rule here,
+// before any value is decoded: canonical "version", an ASCII letter-case
+// variant and the Unicode-folded long-s "verſion" all name the same field, so
+// two such spellings on one job make its bound version depend on key order and
+// corrupt the read. Catching it here — rather than only in the record decoder
+// — also covers two byte-identical "version" keys, which the record's strict
+// member walk would otherwise reject without the id in hand. The verdict is
+// deferred to the end of each record solely so a version written before the id
+// still names the job; every token is consumed regardless. Nested member
+// values keep the ordinary recursive duplicate scan. A null array stays the
+// pre-existing "no jobs" reading.
+func scanJobArrayDuplicates(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return corruptf("data file envelope field \"jobs\" is not valid JSON: %v", err)
+	}
+	if tok == nil { // null: json.Unmarshal would produce no jobs
+		return nil
+	}
+	if tok != json.Delim('[') {
+		return corruptf("data file envelope field \"jobs\" must be an array")
+	}
+	index := 0
+	for dec.More() {
+		index++
+		positional := fmt.Sprintf("job record #%d", index)
+		open, err := dec.Token()
+		if err != nil {
+			return corruptf("%s is not valid JSON: %v", positional, err)
+		}
+		if open == nil {
+			return corruptf("%s must be a JSON object, not null", positional)
+		}
+		if open != json.Delim('{') {
+			return corruptf("%s must be a JSON object", positional)
+		}
+		var (
+			id          string
+			seenExact   = make(map[string]bool)
+			dupKey      string
+			versionKeys []string
+			nestedErr   error
+		)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return corruptf("%s is not valid JSON: %v", positional, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return corruptf("%s is not valid JSON", positional)
+			}
+			// Consume the whole value first; judgments below use only the key
+			// (and, for id, the already-captured bytes). Job members are
+			// scalars, but an unknown member may carry an object/array whose
+			// own duplicate keys must still fail the read.
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				return corruptf("%s is not valid JSON: %v", positional, err)
+			}
+			if key == "id" {
+				if idVal, ierr := storedRecordShape.string(value, positional+` field "id"`); ierr == nil {
+					id = idVal
+				}
+			}
+			if strings.EqualFold(key, jobVersionKey) {
+				versionKeys = append(versionKeys, key)
+			}
+			if seenExact[key] && dupKey == "" {
+				dupKey = key
+			}
+			seenExact[key] = true
+			trimmed := bytes.TrimSpace(value)
+			if nestedErr == nil && len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+				nd := json.NewDecoder(bytes.NewReader(trimmed))
+				nestedErr = skipValueWithDupKeys(nd, positional+" field "+strconv.Quote(key))
+			}
+		}
+		if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
+			return corruptf("%s is not valid JSON", positional)
+		}
+		what := positional
+		if id != "" {
+			what = fmt.Sprintf("stored job record %q", id)
+		}
+		// A repeated version spelling is the pinned-version ambiguity and gets
+		// the specific message, including when both keys are byte-identical.
+		if len(versionKeys) > 1 {
+			sort.Strings(versionKeys)
+			quoted := make([]string, len(versionKeys))
+			for i, k := range versionKeys {
+				quoted[i] = strconv.Quote(k)
+			}
+			return corruptf("%s carries the pinned version field %q more than once (as %s)",
+				what, jobVersionKey, strings.Join(quoted, ", "))
+		}
+		if dupKey != "" {
+			return corruptf("%s contains duplicate field %q", what, dupKey)
+		}
+		if nestedErr != nil {
+			return nestedErr
+		}
+	}
+	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim(']') {
+		return corruptf("data file envelope field \"jobs\" is not valid JSON")
 	}
 	return nil
 }
@@ -611,13 +733,15 @@ type persistJob struct {
 // compiled-artifact binding field.
 const compiledHashKey = "compiled_hash"
 
-// isCompiledHashKey reports whether key is an accepted spelling of the
-// compiled-artifact binding field: only "compiled_hash" itself and ASCII
-// letter-case variants such as "COMPILED_HASH" or "CoMpIlEd_HaSh". Keys are
-// already JSON-unescaped at this point, so an escaped spelling of any of
-// these forms lands here too. Non-ASCII letters are never folded here.
-func isCompiledHashKey(key string) bool {
-	if len(key) != len(compiledHashKey) {
+// isASCIIFoldOf reports whether key names canonical under an ASCII-only
+// letter-case fold: the two must have the same byte length and every byte
+// must match after mapping A-Z onto a-z. JSON keys arrive here already
+// unescaped, so a key written with a \uXXXX escape for an ASCII letter (say
+// u0076 for "v") is judged on its decoded spelling too. A key of a different
+// length, or one that needs a non-ASCII rune to match, returns false — use
+// strings.EqualFold to detect those non-ASCII lookalikes separately.
+func isASCIIFoldOf(key, canonical string) bool {
+	if len(key) != len(canonical) {
 		return false
 	}
 	for i := 0; i < len(key); i++ {
@@ -625,12 +749,26 @@ func isCompiledHashKey(key string) bool {
 		if c >= 'A' && c <= 'Z' {
 			c += 'a' - 'A'
 		}
-		if c != compiledHashKey[i] {
+		if c != canonical[i] {
 			return false
 		}
 	}
 	return true
 }
+
+// isCompiledHashKey reports whether key is an accepted spelling of the
+// compiled-artifact binding field: only "compiled_hash" itself and ASCII
+// letter-case variants such as "COMPILED_HASH" or "CoMpIlEd_HaSh". Keys are
+// already JSON-unescaped at this point, so an escaped spelling of any of
+// these forms lands here too. Non-ASCII letters are never folded here.
+func isCompiledHashKey(key string) bool {
+	return isASCIIFoldOf(key, compiledHashKey)
+}
+
+// jobVersionKey is the canonical spelling of a job record's pinned circuit
+// version field. The version names the frozen circuit — and thereby its
+// trusted setup and compiled artifact — the job belongs to.
+const jobVersionKey = "version"
 
 // compiledHashLookalike reports a member key encoding/json would match onto
 // the binding field's struct tag yet which is not an accepted ASCII spelling
@@ -691,24 +829,48 @@ func compiledHashLookalike(members map[string]json.RawMessage) string {
 // either key order and whether the two values agree. The damaged binding
 // must never read as an unbound job and disappear on the next commit.
 //
-// Only the binding field is judged here; every other field keeps the
+// The pinned version field is held to a uniqueness rule of its own. The
+// "version" the record writes is the sole authority for which frozen circuit
+// — and therefore which trusted setup and compiled artifact — the job belongs
+// to. Every spelling the ordinary decode below fills Version from counts as
+// that one field: canonical "version", an ASCII letter-case variant such as
+// "VERSION", and, since struct-tag matching folds with Unicode case rules,
+// the long-s "verſion" (U+017F, direct or u017f-escaped); keys are compared
+// after JSON unescaping, so an escaped spelling lands here too. Two such
+// spellings on one record are refused as data corruption whether the values
+// agree or differ, whether both values are legal versions, and even when
+// unrelated fields are interleaved between them: encoding/json would keep
+// the last value, so without this check a job could be read against a
+// different frozen, set-up version purely from key order. A non-ASCII
+// "verſion" is refused only when another recognized spelling sits beside it;
+// appearing by itself it is the single version field and keeps the current
+// reading (the ordinary decode folds it onto Version). A single spelling of
+// any kind keeps its current value and spelling compatibility, and an illegal
+// single value — a string, a float, null, or a non-positive version — is
+// rejected exactly as before, by the decode or validateEnvelope.
+//
+// Only these two job fields are judged here; every other field keeps the
 // ordinary struct decoding.
 func (j *persistJob) UnmarshalJSON(raw []byte) error {
 	const what = "stored job record"
 	if string(bytes.TrimSpace(raw)) == "null" {
 		return corruptf("%s must be a JSON object, not null", what)
 	}
-	members, err := strictObjectMembers(raw, what, nil)
+	// Name the job up front, best-effort, so a failure of the strict member
+	// walk below — an exact duplicate key is rejected there before a member map
+	// exists — still locates the record it came from. This probe only labels
+	// errors: a missing, non-string or undecodable id leaves the generic name,
+	// and the id is decoded for real by the ordinary pass later.
+	where := what
+	var idProbe struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &idProbe); err == nil && idProbe.ID != "" {
+		where = fmt.Sprintf("stored job record %q", idProbe.ID)
+	}
+	members, err := strictObjectMembers(raw, where, nil)
 	if err != nil {
 		return err
-	}
-	// Name the job in a binding-field failure when its id is legible; the id
-	// itself is decoded for real by the ordinary pass below.
-	where := what
-	if idRaw, ok := members["id"]; ok {
-		if id, idErr := storedRecordShape.string(idRaw, what+` field "id"`); idErr == nil {
-			where = fmt.Sprintf("stored job record %q", id)
-		}
 	}
 	// Reject a non-ASCII spelling that encoding/json's Unicode-folded tag
 	// matching would silently read as this field ("compiled_haſh" with long
@@ -719,6 +881,42 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 		return corruptf("%s carries the binding field %q under non-ASCII spelling %q; such a lookalike spelling is data corruption",
 			where, compiledHashKey, alias)
 	}
+	// Every spelling the ordinary read below would fill Version from is one
+	// version field: canonical "version", an ASCII letter-case variant, or a
+	// JSON-escaped spelling that unescapes onto either — and, because
+	// encoding/json's struct-tag matching folds with Unicode case rules
+	// (strings.EqualFold), the long-s "verſion" (U+017F, direct or u017f-
+	// escaped) too. The pinned version selects the frozen circuit, its trusted
+	// setup and its artifact, so a record carrying two such spellings is
+	// ambiguous: encoding/json keeps the last value, which would let the
+	// binding flip depending on key order (or let an unhashed job read against
+	// a different frozen, set-up version). Whatever the two values are — equal
+	// or different, both legal — and even with unrelated fields interleaved
+	// between them, the whole record is refused rather than resolved by order.
+	// A long-s spelling counts here only beside another recognized spelling;
+	// standing alone it is the single version field and keeps the current
+	// reading handled below.
+	var versionKeys []string
+	for key := range members {
+		if strings.EqualFold(key, jobVersionKey) {
+			versionKeys = append(versionKeys, key)
+		}
+	}
+	if len(versionKeys) > 1 {
+		sort.Strings(versionKeys)
+		quoted := make([]string, len(versionKeys))
+		for i, k := range versionKeys {
+			quoted[i] = strconv.Quote(k)
+		}
+		return corruptf("%s carries the pinned version field %q more than once (as %s)",
+			where, jobVersionKey, strings.Join(quoted, ", "))
+	}
+	// With zero or one recognized spelling, the ordinary decode below already
+	// yields the current value: a single canonical/ASCII/long-s spelling folds
+	// onto Version, and a missing version reads as 0 and is rejected by
+	// validateEnvelope as a job bound to an unknown circuit. Illegal single
+	// values (a string, a float, null, zero or negative) keep being rejected by
+	// that same decode or the envelope validation, so nothing is picked here.
 	// Every accepted spelling of the binding field counts as the same one
 	// field; the record may carry it at most once, however it is capitalized.
 	var bindingKeys []string
