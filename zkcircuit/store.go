@@ -659,6 +659,63 @@ func compiledHashLookalike(members map[string]json.RawMessage) string {
 	return aliases[0]
 }
 
+// jobVersionKey is the canonical spelling of a job record's pinned-circuit
+// version field.
+const jobVersionKey = "version"
+
+// isJobVersionKey reports whether key is an accepted spelling of the pinned
+// version field: only "version" itself and its ASCII letter-case variants
+// ("VERSION", "VeRsIoN", …). Keys arrive already JSON-unescaped, so an
+// escaped spelling of any such form lands here too. Non-ASCII letters are
+// never folded here.
+func isJobVersionKey(key string) bool {
+	if len(key) != len(jobVersionKey) {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != jobVersionKey[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Strict decoding of the pinned-circuit version on a committed job record.
+//
+// The single "version" member written in the record is the only authority for
+// which frozen circuit version a job is bound to; it must never be decided by
+// object member order. encoding/json resolves repeated keys by keeping the
+// last value and matches struct tags with Unicode case folding, so a record
+// carrying both "version":1 and "VERSION":2 silently reads as version 2 — and
+// when both versions are frozen with their own trusted setups an unbound job
+// is happily queried against version 2. That ambiguity is data corruption:
+//
+//   - Two accepted ASCII spellings of the field ("version" and any
+//     letter-case variant, a JSON-unescaped spelling included) are the same
+//     field and are refused even when both values are equal or both versions
+//     are legal, and whether or not other members sit between them.
+//   - A non-ASCII spelling that folds onto the field but is not an ASCII case
+//     variant ("verſion" with U+017F long s, directly written or
+//     ſ-escaped) is likewise a duplicate whenever another recognizable
+//     spelling is present, in either key order and whether the values agree;
+//     it cannot be ignored as an unknown member to dodge the rule.
+//   - The duplicate may be spread among the record's other fields; the whole
+//     record is rejected as one object, never resolved by which key is last.
+//
+// A single version spelling keeps the pre-existing reading and spelling
+// compatibility: a lone canonical or ASCII-case-variant key is read with the
+// usual strict integer validation (an already-rejected illegal value such as
+// null, 0 or a string stays rejected), and a lone non-ASCII folded spelling
+// is likewise read by encoding/json exactly as before. The build never picks
+// one of two versions, drops the extra key or pretends the job is absent.
+//
+// Only the version field's uniqueness is judged here; its value type and
+// every other field keep the ordinary strict/struct decoding.
+//
 // Strict decoding of the compiled-artifact binding on a committed job record.
 //
 // compiled_hash is a field whose presence is meaningful: records written
@@ -709,6 +766,26 @@ func (j *persistJob) UnmarshalJSON(raw []byte) error {
 		if id, idErr := storedRecordShape.string(idRaw, what+` field "id"`); idErr == nil {
 			where = fmt.Sprintf("stored job record %q", id)
 		}
+	}
+	// The pinned version may be named exactly once across every spelling
+	// encoding/json would read as the "version" field: canonical, ASCII case
+	// variant, JSON-unescaped, or a U+017F long-s lookalike. Two of them make
+	// the bound version depend on key order and corrupt the read rather than
+	// resolving to the last value.
+	var versionKeys []string
+	for key := range members {
+		if isJobVersionKey(key) || strings.EqualFold(key, jobVersionKey) {
+			versionKeys = append(versionKeys, key)
+		}
+	}
+	if len(versionKeys) > 1 {
+		sort.Strings(versionKeys)
+		quoted := make([]string, len(versionKeys))
+		for i, k := range versionKeys {
+			quoted[i] = strconv.Quote(k)
+		}
+		return corruptf("%s names its pinned circuit version more than once (version field %q appears as %s); the bound version must not depend on field order",
+			where, jobVersionKey, strings.Join(quoted, ", "))
 	}
 	// Reject a non-ASCII spelling that encoding/json's Unicode-folded tag
 	// matching would silently read as this field ("compiled_haſh" with long
