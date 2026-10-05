@@ -440,11 +440,12 @@ type persistCircuit struct {
 //
 // The name field carries one rule beyond shape: its raw JSON string token
 // must denote its value exactly — valid UTF-8 in the literal portions and no
-// unpaired \uXXXX surrogate escapes (checkStoredNameEncoding). Both damage
+// unpaired \uXXXX surrogate escapes (checkStoredStringEncoding). Both damage
 // shapes decode to U+FFFD replacement characters under encoding/json, which
 // would rename the circuit on read; they are data corruption, and the whole
-// directory read is refused. Only the name is judged this way; every other
-// field keeps the ordinary decoding rules.
+// directory read is refused. Only the name is judged this way here; every
+// other circuit field keeps the ordinary decoding rules. (The same identity
+// rule guards a saved job's id in job_record.go.)
 //
 // Only shape is judged here. The domain rules (non-blank name, positive
 // version and constraint count, non-negative input counts) keep being
@@ -505,7 +506,7 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	// UTF-8 bytes and unpaired \uXXXX surrogate escapes to U+FFFD, so the
 	// decoded string alone cannot tell a damaged name apart from one that
 	// legitimately contains "�". Judge the raw JSON token instead.
-	if err := checkStoredNameEncoding(members["name"], what+` field "name"`); err != nil {
+	if err := checkStoredStringEncoding(members["name"], what+` field "name"`); err != nil {
 		return err
 	}
 	if err := requireInt("version", &out.Version); err != nil {
@@ -558,11 +559,11 @@ func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, e
 	return strictObjectMembers(raw, what, persistCircuitFields)
 }
 
-// checkStoredNameEncoding enforces the circuit-name identity rule on the raw
-// JSON string token of a committed circuit record's name field. The string
-// has already been decoded by the strict member read, so the token is known
-// to be one complete, well-formed JSON string; this walk judges only what
-// that decode silently repairs:
+// checkStoredStringEncoding enforces an identity-field rule on the raw JSON
+// string token of a committed record's identity value (a circuit's name or a
+// job's id). The string has already been decoded by the strict member read,
+// so the token is known to be one complete, well-formed JSON string; this
+// walk judges only what that decode silently repairs:
 //
 //   - invalid UTF-8 bytes in the literal (unescaped) portions — a lone
 //     continuation byte, a truncated multi-byte character, an overlong
@@ -571,15 +572,17 @@ func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, e
 //     immediately followed by its low-surrogate escape, or a low surrogate
 //     standing alone — which are rewritten to U+FFFD the same way.
 //
-// Both would make the record read back under a different name than the bytes
-// on disk carry, so the record is data corruption rather than a circuit
-// named with a replacement character it never had. A legal surrogate pair
-// decodes to its astral character, an actually committed "�" (written
-// directly or as a U+FFFD escape) is an ordinary name, and the literal six
-// characters "\uD800" — written with an escaped backslash — carry no escape
-// at all: all three keep their exact value. Only the name field is judged
-// here; every other field keeps the ordinary decoding rules.
-func checkStoredNameEncoding(raw json.RawMessage, what string) error {
+// Both would make the record read back under a different identity than the
+// bytes on disk carry, so the record is data corruption rather than a value
+// that was committed with a replacement character it never had. A legal
+// surrogate pair decodes to its astral character, an actually committed "�"
+// (written directly or as a U+FFFD escape) is an ordinary value, and the
+// literal six characters "\uD800" — written with an escaped backslash —
+// carry no escape at all: all three keep their exact value. The walk is
+// shared by the circuit-name check (store.go) and the job-id check
+// (job_record.go); callers name the record and field through what, so an
+// error attributes the damage to the exact record and identity field.
+func checkStoredStringEncoding(raw json.RawMessage, what string) error {
 	token := bytes.TrimSpace(raw)
 	// The token is a complete JSON string (the strict string read above
 	// succeeded), so every escape is well-formed and the walk stays in
@@ -603,9 +606,9 @@ func checkStoredNameEncoding(raw json.RawMessage, what string) error {
 						continue
 					}
 				}
-				return corruptf("%s contains an unpaired high surrogate escape (\\u%04X); the committed name would not read back unchanged", what, code)
+				return corruptf("%s contains an unpaired high surrogate escape (\\u%04X); the committed value would not read back unchanged", what, code)
 			case code >= 0xDC00 && code <= 0xDFFF:
-				return corruptf("%s contains an unpaired low surrogate escape (\\u%04X); the committed name would not read back unchanged", what, code)
+				return corruptf("%s contains an unpaired low surrogate escape (\\u%04X); the committed value would not read back unchanged", what, code)
 			}
 			i += 6
 			continue
@@ -616,7 +619,7 @@ func checkStoredNameEncoding(raw json.RawMessage, what string) error {
 		}
 		r, size := utf8.DecodeRune(token[i:])
 		if r == utf8.RuneError && size == 1 {
-			return corruptf("%s contains invalid UTF-8 bytes; the committed name would not read back unchanged", what)
+			return corruptf("%s contains invalid UTF-8 bytes; the committed value would not read back unchanged", what)
 		}
 		i += size
 	}

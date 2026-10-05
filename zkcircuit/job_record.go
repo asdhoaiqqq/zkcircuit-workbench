@@ -102,6 +102,15 @@ func isCompiledHashKey(key string) bool {
 	return isASCIIFoldOf(key, compiledHashKey)
 }
 
+// isJobIDKey reports whether key names a job record's id field under a
+// spelling the ordinary decode fills ID from: canonical "id" and ASCII
+// letter-case variants such as "ID" or "Id", including a JSON-escaped
+// spelling that unescapes onto either. Non-ASCII lookalikes are not
+// recognized here, matching the binding field: the id has no lookalike rule.
+func isJobIDKey(key string) bool {
+	return isASCIIFoldOf(key, jobIDKey)
+}
+
 // rejectAmbiguousJobVersion enforces the pinned-version uniqueness rule shared
 // by the directory scan and the single-record decode (both drive readJobRecord):
 // the version a job writes is the sole authority for which frozen circuit — and
@@ -178,24 +187,33 @@ type jobMember struct {
 // (decodeJob) — build one through readJobRecord. It records only what the
 // shared rules need: the members in document order (exact spelling), the
 // first member key repeated under that same exact spelling, the best-effort
-// id used to name the record, and any duplicate key nested inside a member's
-// own object/array value. Turning the members into a typed persistJob is left
-// to the ordinary struct decode, which runs once afterwards.
+// id used to name the record, any duplicate key nested inside a member's
+// own object/array value, and any identity-encoding damage on an id token.
+// Turning the members into a typed persistJob is left to the ordinary struct
+// decode, which runs once afterwards.
 type jobRecordScan struct {
 	positional string
 	members    []jobMember
 	dupKey     string
 	id         string
 	nestedErr  error
+	// idEncRaw records the first recognized id spelling (canonical "id" or an
+	// ASCII case / JSON-escaped variant) whose raw string token would not
+	// survive a save/read round-trip — invalid UTF-8 bytes or an unpaired
+	// \uXXXX surrogate. Judged in with the scan-owned findings and located by
+	// record number (scanName), since the id cannot be restored reliably.
+	idEncRaw json.RawMessage
 }
 
 // scanName locates the record for a directory-scan finding: by its id when an
 // exact "id" spelling held a legible string, else by its 1-based position.
 // The id probe is deliberately exact — an "ID" case variant is not the id for
 // scan attribution — and is best-effort: a missing, non-string or
-// undecodable id leaves the positional name.
+// undecodable id leaves the positional name. An id with damaged encoding is
+// never legible for attribution (it would print a replacement character),
+// so such a record is located by its position as well.
 func (r *jobRecordScan) scanName() string {
-	if r.id != "" {
+	if r.id != "" && r.idEncRaw == nil {
 		return fmt.Sprintf("stored job record %q", r.id)
 	}
 	return r.positional
@@ -273,6 +291,24 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 				r.id = idVal
 			}
 		}
+		// Every spelling the ordinary decode fills ID from — canonical "id"
+		// and an ASCII case / JSON-escaped variant — must carry a value that
+		// survives a save/read round-trip. encoding/json silently rewrites
+		// invalid UTF-8 bytes and unpaired surrogate escapes to U+FFFD, so
+		// such a token would re-key the job (and collide with an id that
+		// genuinely contains "�"); the raw token is judged below and the read
+		// refused rather than restoring a replaced id. Every recognized
+		// spelling is checked, so damage on a later variant is caught even
+		// when an earlier exact "id" was legible; any damage forces the
+		// finding to be located by record number (scanName), since the id
+		// cannot be restored reliably.
+		if isJobIDKey(key) {
+			if idVal, ierr := storedRecordShape.string(value, positional+` field "id"`); ierr == nil && idVal != "" {
+				if checkStoredStringEncoding(value, positional+` field "id"`) != nil && r.idEncRaw == nil {
+					r.idEncRaw = value
+				}
+			}
+		}
 		if seenExact[key] && r.dupKey == "" {
 			r.dupKey = key
 		}
@@ -290,15 +326,32 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 	return r, nil
 }
 
+// idEncodingError reports identity-encoding damage on the record's id: an id
+// token (under the canonical "id" or an ASCII case / JSON-escaped spelling)
+// whose invalid UTF-8 bytes or unpaired surrogate escape would be rewritten
+// to U+FFFD by encoding/json, so the job would not read back under the id
+// that was committed. where already locates the record — by its id when one
+// is legible, else by its 1-based position — and the checker names the id
+// field. A damaged id is always located positionally.
+func (r *jobRecordScan) idEncodingError(where string) error {
+	if r.idEncRaw == nil {
+		return nil
+	}
+	return checkStoredStringEncoding(r.idEncRaw, where+` field "id"`)
+}
+
 // judge applies the findings the directory scan owns, in the order they have
 // always surfaced there:
 //
 //  1. two recognized spellings of the pinned version field — equal or
 //     differing values, both legal, even with unrelated members interleaved —
 //     so the bound version is never chosen by key order;
-//  2. an exact repeated member key (the first such key in document order,
+//  2. an id token whose encoding would not survive a save/read round-trip
+//     (invalid UTF-8 bytes or an unpaired surrogate), so the job is never
+//     re-keyed onto a replacement character;
+//  3. an exact repeated member key (the first such key in document order,
 //     including two byte-identical keys a member map could not retain);
-//  3. a duplicate key nested inside a member's own object/array value.
+//  4. a duplicate key nested inside a member's own object/array value.
 //
 // The binding-field lookalike, duplicate-binding and binding-value-type rules
 // are deliberately not here: the typed decode (which runs after the scan) owns
@@ -306,6 +359,9 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 // binding finding — is preserved when several problems coexist.
 func (r *jobRecordScan) judge(where string) error {
 	if err := rejectAmbiguousJobVersion(where, r.memberKeys()); err != nil {
+		return err
+	}
+	if err := r.idEncodingError(where); err != nil {
 		return err
 	}
 	if r.dupKey != "" {
@@ -432,13 +488,18 @@ func decodeJob(raw []byte, what string, out *persistJob) error {
 	// folds id spellings the same way the final decode does (so an "ID"
 	// variant still names the record), and a missing or non-string id leaves
 	// the generic name. The probe only labels errors; the id is decoded for
-	// real by the ordinary pass below.
+	// real by the ordinary pass below. A record whose id token has damaged
+	// encoding is left under the generic name: the probe would carry U+FFFD
+	// replacement characters and could not name the record reliably (the
+	// directory scan names that case by record number before this runs).
 	where := what
-	var idProbe struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &idProbe); err == nil && idProbe.ID != "" {
-		where = fmt.Sprintf("stored job record %q", idProbe.ID)
+	if r.idEncRaw == nil {
+		var idProbe struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &idProbe); err == nil && idProbe.ID != "" {
+			where = fmt.Sprintf("stored job record %q", idProbe.ID)
+		}
 	}
 
 	// The scan-owned findings (version ambiguity, exact and nested duplicate
