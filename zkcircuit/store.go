@@ -543,9 +543,13 @@ type persistCircuit struct {
 // may be absent or null (the legacy counts-only state); when present it goes
 // through the strict persistDefinition decoder.
 //
-// Only shape is judged here. The domain rules (non-blank name, positive
-// version and constraint count, non-negative input counts) keep being
-// re-checked by validateEnvelope.
+// Only shape is judged here — plus, for the name alone, the lossless-
+// readability rule of checkStoredNameRaw: a committed name carrying invalid
+// UTF-8 bytes or an unpaired-surrogate escape is data corruption, since the
+// ordinary decode would silently read it back with U+FFFD substitutions and
+// the circuit would answer to a different name than the one committed. The
+// domain rules (non-blank name, positive version and constraint count,
+// non-negative input counts) keep being re-checked by validateEnvelope.
 
 var persistCircuitFields = []string{
 	"name", "version", "constraints", "public_inputs", "private_inputs",
@@ -595,6 +599,15 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	}
 
 	if err := requireString("name", &out.Name); err != nil {
+		return err
+	}
+	// The name is the version's identity and must read back exactly as
+	// committed. encoding/json silently decodes invalid UTF-8 bytes and
+	// unpaired-surrogate \uXXXX escapes as U+FFFD, which would rename the
+	// circuit on read, so the raw literal is checked before the decoded
+	// value is trusted. Only the name is held to this; every other field
+	// keeps the ordinary decoding below.
+	if err := checkStoredNameRaw(members["name"], what+" field "+strconv.Quote("name")); err != nil {
 		return err
 	}
 	if err := requireInt("version", &out.Version); err != nil {

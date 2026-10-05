@@ -13,14 +13,20 @@ import (
 
 // CreateCircuit creates a draft circuit version identified by Name+Version.
 //
-// The name must be non-empty and not only whitespace; Version must be
-// positive; Constraints must be positive; the input counts must not be
-// negative. Creating an already-existing version is idempotent when the
-// description is identical (the stored record is returned unchanged); a
-// differing description is reported as ErrConflict. Nothing about an
-// existing version — frozen or not — is ever replaced by Create.
+// The name must be non-empty, not only whitespace, and complete, legal
+// UTF-8: it is the version's identity, so it must survive committing and
+// reading back byte-for-byte rather than being silently rewritten (invalid
+// bytes would persist as U+FFFD and the circuit would change names).
+// Version must be positive; Constraints must be positive; the input counts
+// must not be negative. Creating an already-existing version is idempotent
+// when the description is identical (the stored record is returned
+// unchanged); a differing description is reported as ErrConflict. Nothing
+// about an existing version — frozen or not — is ever replaced by Create.
 func (s *Store) CreateCircuit(c Circuit) (Circuit, error) {
 	if err := validateCircuitKey(c.Name, c.Version); err != nil {
+		return Circuit{}, err
+	}
+	if err := validateCircuitNameUTF8(c.Name); err != nil {
 		return Circuit{}, err
 	}
 	if err := validateCounts(c.Constraints, c.PublicInputs, c.PrivateInputs); err != nil {
