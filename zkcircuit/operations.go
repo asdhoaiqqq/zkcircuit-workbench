@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // This file holds the domain operations of the persistent workbench. Every
@@ -15,13 +16,22 @@ import (
 //
 // The name must be non-empty and not only whitespace; Version must be
 // positive; Constraints must be positive; the input counts must not be
-// negative. Creating an already-existing version is idempotent when the
-// description is identical (the stored record is returned unchanged); a
-// differing description is reported as ErrConflict. Nothing about an
-// existing version — frozen or not — is ever replaced by Create.
+// negative. The name must additionally be complete, valid UTF-8: it is the
+// version's identity and is looked up by exact value, and encoding/json
+// silently rewrites invalid byte sequences (a lone continuation byte, a
+// truncated multi-byte character, …) to U+FFFD when the record is marshaled,
+// so accepting them would save the circuit under a different name than the
+// caller submitted. Such a request is refused as ErrInvalidArgument before
+// anything is committed. Creating an already-existing version is idempotent
+// when the description is identical (the stored record is returned
+// unchanged); a differing description is reported as ErrConflict. Nothing
+// about an existing version — frozen or not — is ever replaced by Create.
 func (s *Store) CreateCircuit(c Circuit) (Circuit, error) {
 	if err := validateCircuitKey(c.Name, c.Version); err != nil {
 		return Circuit{}, err
+	}
+	if !utf8.ValidString(c.Name) {
+		return Circuit{}, invalidf("circuit name must be valid UTF-8; the submitted name contains invalid byte sequences")
 	}
 	if err := validateCounts(c.Constraints, c.PublicInputs, c.PrivateInputs); err != nil {
 		return Circuit{}, err

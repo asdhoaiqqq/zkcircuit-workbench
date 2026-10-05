@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // on-disk layout inside the data directory:
@@ -543,6 +544,14 @@ type persistCircuit struct {
 // may be absent or null (the legacy counts-only state); when present it goes
 // through the strict persistDefinition decoder.
 //
+// The name field carries one rule beyond shape: its raw JSON string token
+// must denote its value exactly — valid UTF-8 in the literal portions and no
+// unpaired \uXXXX surrogate escapes (checkStoredNameEncoding). Both damage
+// shapes decode to U+FFFD replacement characters under encoding/json, which
+// would rename the circuit on read; they are data corruption, and the whole
+// directory read is refused. Only the name is judged this way; every other
+// field keeps the ordinary decoding rules.
+//
 // Only shape is judged here. The domain rules (non-blank name, positive
 // version and constraint count, non-negative input counts) keep being
 // re-checked by validateEnvelope.
@@ -597,6 +606,14 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 	if err := requireString("name", &out.Name); err != nil {
 		return err
 	}
+	// The name is the version's identity and must read back as the exact
+	// value that was committed. encoding/json silently rewrites both invalid
+	// UTF-8 bytes and unpaired \uXXXX surrogate escapes to U+FFFD, so the
+	// decoded string alone cannot tell a damaged name apart from one that
+	// legitimately contains "�". Judge the raw JSON token instead.
+	if err := checkStoredNameEncoding(members["name"], what+` field "name"`); err != nil {
+		return err
+	}
 	if err := requireInt("version", &out.Version); err != nil {
 		return err
 	}
@@ -645,6 +662,71 @@ func (c *persistCircuit) UnmarshalJSON(raw []byte) error {
 // demanding a JSON object with exactly the known top-level fields once.
 func strictCircuitObject(raw []byte, what string) (map[string]json.RawMessage, error) {
 	return strictObjectMembers(raw, what, persistCircuitFields)
+}
+
+// checkStoredNameEncoding enforces the circuit-name identity rule on the raw
+// JSON string token of a committed circuit record's name field. The string
+// has already been decoded by the strict member read, so the token is known
+// to be one complete, well-formed JSON string; this walk judges only what
+// that decode silently repairs:
+//
+//   - invalid UTF-8 bytes in the literal (unescaped) portions — a lone
+//     continuation byte, a truncated multi-byte character, an overlong
+//     form — which encoding/json rewrites to U+FFFD, and
+//   - \uXXXX escapes forming an unpaired surrogate — a high surrogate not
+//     immediately followed by its low-surrogate escape, or a low surrogate
+//     standing alone — which are rewritten to U+FFFD the same way.
+//
+// Both would make the record read back under a different name than the bytes
+// on disk carry, so the record is data corruption rather than a circuit
+// named with a replacement character it never had. A legal surrogate pair
+// decodes to its astral character, an actually committed "�" (written
+// directly or as a U+FFFD escape) is an ordinary name, and the literal six
+// characters "\uD800" — written with an escaped backslash — carry no escape
+// at all: all three keep their exact value. Only the name field is judged
+// here; every other field keeps the ordinary decoding rules.
+func checkStoredNameEncoding(raw json.RawMessage, what string) error {
+	token := bytes.TrimSpace(raw)
+	// The token is a complete JSON string (the strict string read above
+	// succeeded), so every escape is well-formed and the walk stays in
+	// bounds; only the replacement-prone content is judged.
+	for i := 1; i < len(token)-1; {
+		c := token[i]
+		if c == '\\' {
+			if token[i+1] != 'u' {
+				i += 2 // a simple escape: \" \\ \/ \b \f \n \r \t
+				continue
+			}
+			code, _ := strconv.ParseUint(string(token[i+2:i+6]), 16, 32)
+			switch {
+			case code >= 0xD800 && code <= 0xDBFF:
+				// A high surrogate is whole only when its low-surrogate
+				// escape follows immediately.
+				if i+12 <= len(token) && token[i+6] == '\\' && token[i+7] == 'u' {
+					lo, _ := strconv.ParseUint(string(token[i+8:i+12]), 16, 32)
+					if lo >= 0xDC00 && lo <= 0xDFFF {
+						i += 12
+						continue
+					}
+				}
+				return corruptf("%s contains an unpaired high surrogate escape (\\u%04X); the committed name would not read back unchanged", what, code)
+			case code >= 0xDC00 && code <= 0xDFFF:
+				return corruptf("%s contains an unpaired low surrogate escape (\\u%04X); the committed name would not read back unchanged", what, code)
+			}
+			i += 6
+			continue
+		}
+		if c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(token[i:])
+		if r == utf8.RuneError && size == 1 {
+			return corruptf("%s contains invalid UTF-8 bytes; the committed name would not read back unchanged", what)
+		}
+		i += size
+	}
+	return nil
 }
 
 // strictObjectMembers decodes one committed record's own member map,
