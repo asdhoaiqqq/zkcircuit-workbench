@@ -48,8 +48,16 @@ type jsonShape struct {
 }
 
 // object decodes raw as a JSON object whose keys must all be allowed,
-// rejecting syntax errors, trailing data, duplicates, non-objects and
-// unknown keys. It returns the raw members for typed decoding.
+// rejecting syntax errors, trailing data, non-objects and unknown keys. It
+// returns the raw members for typed decoding.
+//
+// It checks its own object's level only: the member map (unknown keys,
+// required/type judgments made by the caller) is decoded here, while a
+// repeated key anywhere in the document is rejected once, up front, by the
+// document-wide rejectDuplicates the top-level decoder runs before any nested
+// object is touched. object itself therefore neither re-scans its subtree nor
+// is re-scanned by an ancestor: every nested object is structurally
+// interpreted exactly once by the decoder that owns its level.
 func (s jsonShape) object(raw []byte, allowed []string, what string) (map[string]json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if string(trimmed) == "null" {
@@ -72,16 +80,22 @@ func (s jsonShape) object(raw []byte, allowed []string, what string) (map[string
 			return nil, s.fail("%s has unknown field %q", what, key)
 		}
 	}
-	if err := s.rejectDuplicates(trimmed, what); err != nil {
-		return nil, err
-	}
 	return members, nil
 }
 
-// rejectDuplicates walks the JSON token stream rejecting any object that
-// names the same key twice; encoding/json silently keeps the last value.
-// Keys are compared after JSON unescaping, so a key repeated through a
-// \uXXXX spelling is still a duplicate, even when both values are identical.
+// rejectDuplicates walks one whole definition document's JSON token stream
+// once, rejecting any object that names the same key twice; encoding/json
+// silently keeps the last value. Keys are compared after JSON unescaping, so a
+// key repeated through a \uXXXX spelling is still a duplicate, even when both
+// values are identical.
+//
+// This is the only duplicate scan a document undergoes. It runs over the full
+// raw document at the top level before any constraint or term object is
+// decoded, so a repeated field is found wherever it is nested but each nested
+// object is walked just this once — never again by a per-object scan. The
+// failure is reported with the document's own name (and the import path's
+// constraint wrapping is deliberately not applied: the document-wide scan
+// attributes the problem to the document as a whole).
 func (s jsonShape) rejectDuplicates(raw []byte, what string) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -269,6 +283,14 @@ var storedDefinitionSource = definitionShapeSource{
 func decodeDefinitionShape(raw []byte, src definitionShapeSource) (definitionShape, error) {
 	members, err := src.shape.object(raw, []string{"modulus", "constraints"}, src.definition)
 	if err != nil {
+		return definitionShape{}, err
+	}
+	// One document-wide duplicate pass over the raw bytes, run before any
+	// nested object is decoded. It is the only duplicate scan the document
+	// undergoes: nested object decoders no longer each re-walk their subtree,
+	// so a term is not tokenized by the definition pass, again by its
+	// constraint and again by itself.
+	if err := src.shape.rejectDuplicates(bytes.TrimSpace(raw), src.definition); err != nil {
 		return definitionShape{}, err
 	}
 	modulusRaw, err := src.shape.require(members, "modulus", src.definition)
