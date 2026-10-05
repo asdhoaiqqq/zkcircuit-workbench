@@ -707,6 +707,12 @@ type Store struct {
 // and fully validated before Open returns; on a corrupt, truncated or
 // unsupported-format file Open returns an error wrapping ErrDataCorrupt and
 // leaves every file in the directory untouched.
+//
+// The directory is pinned to an absolute path the moment it is opened, so a
+// later change of the process working directory can never re-target the
+// store: every read, commit and lock keeps operating on the directory that
+// was opened, never on a different directory that happens to sit at the same
+// relative path elsewhere. Dir reports that absolute location.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, invalidf("data directory must not be empty")
@@ -714,7 +720,15 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create data directory %q: %w", dir, err)
 	}
-	lockPath := filepath.Join(dir, dirLockFile)
+	// Resolve against the current working directory once, while it still
+	// names the directory the caller asked for. Storing the relative path
+	// would let a later os.Chdir silently move every operation — reads,
+	// commits and the corruption check — onto a different bench-data.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
+	}
+	lockPath := filepath.Join(abs, dirLockFile)
 	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open lock file in %q: %w", dir, err)
@@ -725,7 +739,7 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("cannot lock data directory %q: %w", dir, err)
 	}
 
-	s := &Store{dir: dir, lock: lock}
+	s := &Store{dir: abs, lock: lock}
 	if err := s.loadLocked(); err != nil {
 		unlockLock(lock)
 		lock.Close()
@@ -758,7 +772,9 @@ func (s *Store) Close() error {
 	return first
 }
 
-// Dir reports the data directory backing the store.
+// Dir reports the data directory backing the store. The path is absolute
+// (resolved when the store was opened), so it keeps locating the same
+// directory even after the process working directory changes.
 func (s *Store) Dir() string { return s.dir }
 
 func (s *Store) dataPath() string { return filepath.Join(s.dir, dirDataFile) }
