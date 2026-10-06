@@ -805,9 +805,18 @@ func sortEnvelope(env *envelope) {
 
 // validateEnvelope re-checks every invariant on load so a tampered or
 // hand-edited file cannot bypass the domain rules.
+//
+// A stored constraint definition is parsed and canonicalized exactly once
+// per load: the circuit pass validates every defined version against its
+// declared counts and keeps the resulting canonical form, and the artifact
+// pass reuses that same form to verify the recorded modulus, constraint
+// count and hash. The map is built fresh on each call, so the reuse never
+// carries a judgment across loads — every read validates the bytes found on
+// disk at that moment.
 func validateEnvelope(env envelope) error {
 	seenCircuit := make(map[[2]string]bool)
 	circuitOK := make(map[[2]string]bool)
+	canonicalDefs := make(map[[2]string]*canonicalDefinition)
 	for i, c := range env.Circuits {
 		key := [2]string{c.Name, itoa(c.Version)}
 		if c.Name == "" || strings.TrimSpace(c.Name) == "" {
@@ -836,9 +845,11 @@ func validateEnvelope(env envelope) error {
 				c.Name, c.Version, c.PublicInputs, c.PrivateInputs, maxInputWires)
 		}
 		if c.Definition != nil {
-			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
+			def, err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition)
+			if err != nil {
 				return err
 			}
+			canonicalDefs[key] = def
 		}
 		circuitOK[key] = true
 	}
@@ -918,10 +929,11 @@ func validateEnvelope(env envelope) error {
 			return fmt.Errorf("artifact for %q v%d constraint count %d disagrees with the version's %d",
 				a.Name, a.Version, a.Constraints, c.Constraints)
 		}
-		def, err := definitionFromPersist(*c.Definition, c.PublicInputs, c.PrivateInputs)
-		if err != nil {
-			return fmt.Errorf("artifact for %q v%d cannot be checked against its definition: %w", a.Name, a.Version, err)
-		}
+		// The circuit pass above already validated and canonicalized this
+		// version's definition (every artifact requires a defined version,
+		// checked just above), so the artifact check reuses that one result
+		// instead of re-parsing and re-normalizing the same stored definition.
+		def := canonicalDefs[key]
 		if int64(a.Modulus) != def.modulus || len(def.constraints) != a.Constraints {
 			return fmt.Errorf("artifact for %q v%d is inconsistent with its stored definition", a.Name, a.Version)
 		}
@@ -936,16 +948,18 @@ func validateEnvelope(env envelope) error {
 
 // validatePersistDefinition re-validates a stored definition against its
 // version's declared counts: prime modulus, in-range wires and an exact
-// constraint count match.
-func validatePersistDefinition(name string, version, constraints, public, private int, def *persistDefinition) error {
+// constraint count match. On success it returns the canonical form built
+// during validation, so a later check against the same version's artifact
+// reuses it instead of parsing and normalizing the definition a second time.
+func validatePersistDefinition(name string, version, constraints, public, private int, def *persistDefinition) (*canonicalDefinition, error) {
 	parsed, err := definitionFromPersist(*def, public, private)
 	if err != nil {
-		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
+		return nil, fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
 	}
 	if !parsed.compatibleWith(constraints, public, private) {
-		return fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", name, version)
+		return nil, fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", name, version)
 	}
-	return nil
+	return parsed, nil
 }
 
 func findPersistCircuit(cs []persistCircuit, name string, version int) *persistCircuit {
