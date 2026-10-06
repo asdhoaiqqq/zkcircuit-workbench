@@ -702,6 +702,187 @@ type Store struct {
 	data envelope
 }
 
+// resolveDataDir turns the Open argument into the absolute physical
+// directory the store will be permanently pinned to.
+//
+// The argument is resolved exactly the way the kernel reaches it on an
+// open(2) — relative components anchored to the process's current working
+// directory at Open time, one component at a time, every symlink expanded at
+// the position where the walk meets it. No lexical Clean is applied first:
+// filepath.Abs/Clean would fold "entry/.." before the symlink was ever
+// examined, so a ".." standing after a symlink pops the link's resolved
+// target rather than the link's own spelling, and a/link/../x cannot be made
+// to name a/x and select another data directory. Any trailing segment that
+// does not exist yet (a data directory to be created by Open, or a
+// not-yet-existing parent) is appended verbatim to the resolved physical
+// prefix, and MkdirAll creates it beneath that prefix; a ".." after such a
+// missing component cannot be walked faithfully (the kernel reports ENOENT
+// there instead of folding the literal path) and fails the resolution. A
+// dangling entry link — the entry itself is a symlink whose target does not
+// exist — resolves through the link target's spelling and is created there.
+func resolveDataDir(dir string) (string, error) {
+	resolved, err := resolveExistingPrefix(dir)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) {
+		// The walk itself stayed relative to the Open-time working directory;
+		// only now, after every symlink has been expanded and every ".."
+		// popped in walk order, anchor the result absolutely for pinning.
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", err
+		}
+	}
+	return resolved, nil
+}
+
+// maxDataDirLinks bounds symlink expansion while resolving the data
+// directory, matching the kernel's ELOOP guard: a link cycle must fail Open
+// rather than loop forever.
+const maxDataDirLinks = 255
+
+// resolveExistingPrefix walks path the way a kernel path walk reaches it,
+// accepting both absolute and Open-cwd-relative paths. Symlinks are expanded
+// inline where the walk meets them and ".." pops the directory the walk is
+// actually standing in (a link target, not the link spelling). Unlike
+// filepath.EvalSymlinks the walk tolerates a missing tail: at the first
+// component that cannot be Lstat'd, that component and the remaining literal
+// components are appended to the resolved prefix so Open can create the chain
+// with MkdirAll — unless the remainder contains "..", which could not be
+// resolved against a non-existent entry and is an error.
+func resolveExistingPrefix(path string) (string, error) {
+	volLen := len(filepath.VolumeName(path))
+	pathSeparator := string(os.PathSeparator)
+	if volLen < len(path) && os.IsPathSeparator(path[volLen]) {
+		volLen++
+	}
+	vol := path[:volLen] // "/" (or a drive/UNC root elsewhere); "" when relative
+	dest := vol
+	linksWalked := 0
+	for start, end := volLen, volLen; start < len(path); start = end {
+		for start < len(path) && os.IsPathSeparator(path[start]) {
+			start++
+		}
+		end = start
+		for end < len(path) && !os.IsPathSeparator(path[end]) {
+			end++
+		}
+		if end == start {
+			break
+		}
+		comp := path[start:end]
+		if comp == "." {
+			continue
+		}
+		if comp == ".." {
+			// Pop what the walk has actually reached; symlinks have already
+			// been expanded into dest, so this removes the target, never the
+			// link spelling.
+			r := -1
+			for i := len(dest) - 1; i >= volLen; i-- {
+				if os.IsPathSeparator(dest[i]) {
+					r = i
+					break
+				}
+			}
+			if r < volLen || dest[r+1:] == ".." {
+				if len(dest) > volLen {
+					dest += pathSeparator
+				}
+				dest += ".."
+			} else {
+				dest = dest[:r]
+			}
+			continue
+		}
+
+		if len(dest) > len(filepath.VolumeName(dest)) && !os.IsPathSeparator(dest[len(dest)-1]) {
+			dest += pathSeparator
+		}
+		dest += comp
+
+		fi, err := os.Lstat(dest)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+			// Missing tail: append the remainder literally, refusing a
+			// remainder containing ".." (unresolvable against this absent
+			// entry), and let MkdirAll create the chain.
+			for r := end; r < len(path); {
+				for r < len(path) && os.IsPathSeparator(path[r]) {
+					r++
+				}
+				s := r
+				for r < len(path) && !os.IsPathSeparator(path[r]) {
+					r++
+				}
+				switch path[s:r] {
+				case "", ".":
+				case "..":
+					return "", fmt.Errorf("cannot resolve %q: %q does not exist and is followed by a parent reference", path, comp)
+				default:
+					dest += pathSeparator + path[s:r]
+				}
+			}
+			return filepath.Clean(dest), nil
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			if !fi.Mode().IsDir() && end < len(path) {
+				return "", fmt.Errorf("cannot resolve %q: %q is not a directory", path, comp)
+			}
+			continue
+		}
+		linksWalked++
+		if linksWalked > maxDataDirLinks {
+			return "", fmt.Errorf("cannot resolve %q: too many symlinks", path)
+		}
+		link, err := os.Readlink(dest)
+		if err != nil {
+			return "", err
+		}
+		// Expand the link exactly at the walk position: the still-queued
+		// components (including any "..") continue from the target rather
+		// than from the link spelling.
+		path = link + path[end:]
+		switch {
+		case len(link) > 0 && os.IsPathSeparator(link[0]):
+			volLen = 1
+			vol = path[:1]
+			dest = vol
+			end = 1
+		default:
+			if v := filepath.VolumeName(link); v != "" {
+				if len(link) > len(v) && os.IsPathSeparator(link[len(v)]) {
+					v += string(os.PathSeparator)
+				}
+				volLen = len(v)
+				vol = v
+				dest = vol
+				end = volLen
+				break
+			}
+			// Relative link: it names a path from the directory holding the
+			// link, which is dest without the link's own component.
+			r := -1
+			for i := len(dest) - 1; i >= volLen; i-- {
+				if os.IsPathSeparator(dest[i]) {
+					r = i
+					break
+				}
+			}
+			if r < volLen {
+				dest = vol
+			} else {
+				dest = dest[:r]
+			}
+			end = 0
+		}
+	}
+	return filepath.Clean(dest), nil
+}
+
 // Open opens (creating if needed) the workbench data in dir. If the
 // directory does not exist it is created. Existing committed data is loaded
 // and fully validated before Open returns; on a corrupt, truncated or
@@ -712,23 +893,38 @@ type Store struct {
 // time and pinned for the store's lifetime: a relative path such as
 // "bench-data" names one fixed directory from the moment Open succeeds, and
 // later working-directory changes never redirect the store's reads, writes,
-// lock or Dir to another location. Paths to constraint definitions and input
-// files passed to individual operations are not pinned this way — they keep
-// being resolved against the caller's working directory at call time.
+// lock or Dir to another location.
+//
+// The pinning is to the actual directory opened, not to the literal path
+// spelling: symlinks already present in the file system — whether dir itself
+// is a link or one of its parent directories is — are resolved segment by
+// segment at Open time, and Dir reports the resulting absolute physical
+// directory. Repointing or removing an entry link afterwards never moves the
+// store: queries, commits, the lock file and compiled-artifact bindings keep
+// using the original directory even after the link changes or vanishes. A
+// ".." following a symlink is resolved the way the kernel walk reaches it
+// (the already-resolved link target is popped), never by lexical folding of
+// the literal path, so it cannot select a different data directory. A
+// not-yet-existing data directory named through a valid (possibly
+// symlinked) parent is created under the parent's physical location. Paths
+// to constraint definitions and input files passed to individual operations
+// are not pinned this way — they keep being resolved against the caller's
+// working directory at call time.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, invalidf("data directory must not be empty")
 	}
-	// Pin the location now: a relative path would otherwise be re-resolved
-	// against the process working directory on every later file access, so a
-	// chdir after Open could silently move the store onto a different
-	// bench-data. Abs (not EvalSymlinks) so a not-yet-existing directory can
-	// still be created below.
-	absDir, err := filepath.Abs(dir)
+	// Resolve and pin the physical location now, before anything else can
+	// change. resolveDataDir walks the argument the way the kernel reaches
+	// it — relative to the process working directory at Open time, symlinks
+	// expanded segment by segment in walk order and ".." popped in place — so
+	// a later chdir, a repointed or deleted entry link, or a ".." sitting
+	// after a symlink cannot move reads, writes, the lock or Dir onto another
+	// directory. The result is absolute and names the real directory opened.
+	dir, err := resolveDataDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
 	}
-	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create data directory %q: %w", dir, err)
 	}
