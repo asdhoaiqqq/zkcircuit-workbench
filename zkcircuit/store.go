@@ -805,9 +805,19 @@ func sortEnvelope(env *envelope) {
 
 // validateEnvelope re-checks every invariant on load so a tampered or
 // hand-edited file cannot bypass the domain rules.
+//
+// A version carrying a stored definition has its definition parsed and
+// canonicalized exactly once, while that version's circuit record is checked.
+// The resulting canonical definition is kept in validatedDefinitions and
+// reused by the artifact pass for the modulus/count comparison and hash
+// recomputation, so one read never normalizes the same definition twice — and
+// the check still runs for a draft that has a definition but no compiled
+// artifact, since it belongs to the circuit pass rather than to the point an
+// artifact happens to be present.
 func validateEnvelope(env envelope) error {
 	seenCircuit := make(map[[2]string]bool)
 	circuitOK := make(map[[2]string]bool)
+	validatedDefinitions := make(map[[2]string]*canonicalDefinition)
 	for i, c := range env.Circuits {
 		key := [2]string{c.Name, itoa(c.Version)}
 		if c.Name == "" || strings.TrimSpace(c.Name) == "" {
@@ -836,9 +846,14 @@ func validateEnvelope(env envelope) error {
 				c.Name, c.Version, c.PublicInputs, c.PrivateInputs, maxInputWires)
 		}
 		if c.Definition != nil {
-			if err := validatePersistDefinition(c.Name, c.Version, c.Constraints, c.PublicInputs, c.PrivateInputs, c.Definition); err != nil {
+			// One parse and one canonicalization for the whole read: the
+			// artifact pass reuses validatedDefinitions[key] instead of
+			// rebuilding the same canonical form a second time.
+			def, err := canonicalizeStoredDefinition(c)
+			if err != nil {
 				return err
 			}
+			validatedDefinitions[key] = def
 		}
 		circuitOK[key] = true
 	}
@@ -918,10 +933,10 @@ func validateEnvelope(env envelope) error {
 			return fmt.Errorf("artifact for %q v%d constraint count %d disagrees with the version's %d",
 				a.Name, a.Version, a.Constraints, c.Constraints)
 		}
-		def, err := definitionFromPersist(*c.Definition, c.PublicInputs, c.PrivateInputs)
-		if err != nil {
-			return fmt.Errorf("artifact for %q v%d cannot be checked against its definition: %w", a.Name, a.Version, err)
-		}
+		// Reuse the canonical definition built once during the circuit pass:
+		// the artifact pass only compares the modulus and counts and
+		// recomputes the hash, it never re-parses or re-normalizes.
+		def := validatedDefinitions[key]
 		if int64(a.Modulus) != def.modulus || len(def.constraints) != a.Constraints {
 			return fmt.Errorf("artifact for %q v%d is inconsistent with its stored definition", a.Name, a.Version)
 		}
@@ -934,18 +949,21 @@ func validateEnvelope(env envelope) error {
 	return nil
 }
 
-// validatePersistDefinition re-validates a stored definition against its
-// version's declared counts: prime modulus, in-range wires and an exact
-// constraint count match.
-func validatePersistDefinition(name string, version, constraints, public, private int, def *persistDefinition) error {
-	parsed, err := definitionFromPersist(*def, public, private)
+// canonicalizeStoredDefinition rebuilds the canonical form of one stored
+// definition exactly once during a read and checks it against its version's
+// declared counts: prime modulus, in-range wires and an exact constraint
+// count match. The returned canonical definition is what the artifact pass
+// reuses for its modulus/count comparison and hash recomputation, so one read
+// parses and normalizes the definition a single time.
+func canonicalizeStoredDefinition(c persistCircuit) (*canonicalDefinition, error) {
+	parsed, err := definitionFromPersist(*c.Definition, c.PublicInputs, c.PrivateInputs)
 	if err != nil {
-		return fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", name, version, err)
+		return nil, fmt.Errorf("circuit %q v%d has a corrupt constraint definition: %w", c.Name, c.Version, err)
 	}
-	if !parsed.compatibleWith(constraints, public, private) {
-		return fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", name, version)
+	if !parsed.compatibleWith(c.Constraints, c.PublicInputs, c.PrivateInputs) {
+		return nil, fmt.Errorf("circuit %q v%d definition is incompatible with its declared counts", c.Name, c.Version)
 	}
-	return nil
+	return parsed, nil
 }
 
 func findPersistCircuit(cs []persistCircuit, name string, version int) *persistCircuit {
