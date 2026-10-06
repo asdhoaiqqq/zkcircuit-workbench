@@ -325,11 +325,13 @@ func (s jsonShape) intValue(v *jvalue, what string) (int, error) {
 // ---- raw-member helpers for the committed record decoders -----------------
 //
 // The circuit and job records in data.json are decoded member-by-member from
-// a json.RawMessage map (see strictObjectMembers in store.go), one level per
-// record with the values left to their own decoders. These four helpers read
-// one such already-isolated raw member: a required lookup and the strict
-// string/integer/boolean scalars. They share the jsonShape error tagging but
-// operate on raw members rather than the definition document tree.
+// the already-isolated raw members produced by the single per-record reader
+// each record type drives (readCircuitRecord in circuit_record.go and
+// readJobRecord in job_record.go), one level per record with the values left
+// to their own decoders. These four helpers read one such raw member: a
+// required lookup and the strict string/integer/boolean scalars. They share
+// the jsonShape error tagging but operate on raw members rather than the
+// definition document tree.
 
 // requireRaw returns the raw value of a required member.
 func (s jsonShape) require(members map[string]json.RawMessage, key, what string) (json.RawMessage, error) {
