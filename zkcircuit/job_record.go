@@ -35,9 +35,9 @@ import (
 // points and the on-disk format stay as they were. In particular the two read
 // passes keep their historical division of labor and precedence because an
 // open always runs the directory scan before the typed decode: the scan owns
-// structural findings, the pinned-version and owning-circuit ambiguities,
-// exact repeated keys and nested repeated keys (jobRecordScan.judge), while
-// the typed decode owns the
+// structural findings, the job-id, pinned-version and owning-circuit
+// ambiguities, exact repeated keys and nested repeated keys
+// (jobRecordScan.judge), while the typed decode owns the
 // binding-field lookalike, duplicate-binding and binding-value-type findings
 // plus the ordinary struct decode (decodeJob).
 
@@ -107,12 +107,65 @@ func isJobCircuitKey(key string) bool {
 	return isASCIIFoldOf(key, jobCircuitKey)
 }
 
+// isJobIDKey reports whether key names a job record's identity field under
+// any spelling the ordinary decode fills ID from: canonical "id" and the
+// ASCII letter-case variants "ID", "Id", "iD", including a JSON-escaped
+// spelling that unescapes onto one of them (keys arrive here already
+// unescaped). "id" is two ASCII letters, so no non-ASCII rune case-folds
+// onto either letter and the ASCII fold recognizes exactly the keys
+// encoding/json's Unicode-folded tag matching binds to the field.
+func isJobIDKey(key string) bool {
+	return isASCIIFoldOf(key, jobIDKey)
+}
+
 // isCompiledHashKey reports whether key is an accepted spelling of the
 // compiled-artifact binding field: only "compiled_hash" itself and ASCII
 // letter-case variants such as "COMPILED_HASH" or "CoMpIlEd_HaSh". Non-ASCII
 // letters are never folded here; compiledHashLookalike rejects those.
 func isCompiledHashKey(key string) bool {
 	return isASCIIFoldOf(key, compiledHashKey)
+}
+
+// rejectAmbiguousJobID enforces the identity uniqueness rule shared by the
+// directory scan and the single-record decode (both drive readJobRecord):
+// the id is a job's sole, deterministic identity — the key a query uses to
+// find the record — so one record may carry the field under at most one
+// recognized spelling (isJobIDKey): canonical "id", the ASCII letter-case
+// variants "ID", "Id", "iD", or a JSON-escaped spelling that unescapes onto
+// one of them. Two spellings on one record make the job's identity depend on
+// key order, since encoding/json keeps the last value, and corrupt the read:
+// the whole record is refused whether the values agree or differ, whether
+// both are present, non-empty and legal ids, and whether unrelated members
+// (the circuit name, the pinned version, the attempt count, …) sit between
+// them — neither value is ever picked to carry on, and swapping the two keys
+// never changes the refusal or moves the query id. A record carrying only
+// case variants with no lowercase "id" ("ID" beside "Id", …) is refused on
+// the same terms: the pair still names one field twice. Two byte-identical
+// spellings are covered too. A single spelling of any recognized kind is the
+// one id field and keeps its current reading: the value is matched exactly
+// as written, with no case folding, space trimming or U+FFFD repair.
+//
+// keys are the record's member keys in any order; the recognized spellings
+// are filtered and sorted here so the message is deterministic. where names
+// the record positionally — the record has more than one id, so no candidate
+// value may be treated as its settled identity.
+func rejectAmbiguousJobID(where string, keys []string) error {
+	var idKeys []string
+	for _, key := range keys {
+		if isJobIDKey(key) {
+			idKeys = append(idKeys, key)
+		}
+	}
+	if len(idKeys) <= 1 {
+		return nil
+	}
+	sort.Strings(idKeys)
+	quoted := make([]string, len(idKeys))
+	for i, k := range idKeys {
+		quoted[i] = strconv.Quote(k)
+	}
+	return corruptf("%s carries the job id field %q more than once (as %s)",
+		where, jobIDKey, strings.Join(quoted, ", "))
 }
 
 // rejectAmbiguousJobVersion enforces the pinned-version uniqueness rule shared
@@ -329,12 +382,13 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 		// bytes on disk carry it. encoding/json silently rewrites invalid
 		// UTF-8 bytes and unpaired \uXXXX surrogate escapes to U+FFFD, so the
 		// raw token of every spelling the ordinary decode fills ID from
-		// (canonical "id" and ASCII case variants such as "ID") is judged
-		// after the read. The exact "id" token also supplies the best-effort
-		// name used to locate the record. A non-string value (null, a number
-		// …) is left to the ordinary decode's own failure: the encoding walk
-		// below is defined only over one complete JSON string token.
-		isIDSpelling := key == jobIDKey || isASCIIFoldOf(key, jobIDKey)
+		// (isJobIDKey: canonical "id" and the ASCII case variants "ID",
+		// "Id", "iD") is judged after the read. The exact "id" token also
+		// supplies the best-effort name used to locate the record. A
+		// non-string value (null, a number …) is left to the ordinary
+		// decode's own failure: the encoding walk below is defined only over
+		// one complete JSON string token.
+		isIDSpelling := isJobIDKey(key)
 		if isIDSpelling && bytes.HasPrefix(bytes.TrimSpace(value), []byte{'"'}) {
 			if key == jobIDKey {
 				if idVal, ierr := storedRecordShape.string(value, positional+` field "id"`); ierr == nil {
@@ -369,15 +423,21 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 // judge applies the findings the directory scan owns, in the order they
 // surface:
 //
-//  1. two recognized spellings of the pinned version field — equal or
+//  1. two recognized spellings of the job id field — equal or differing
+//     values, both present and legal, even with unrelated members interleaved
+//     and even with no lowercase "id" among them — so the job's identity is
+//     never chosen by key order; this finding names the record positionally
+//     (r.positional), never by a candidate id, because the record itself
+//     refuses to settle which value that is;
+//  2. two recognized spellings of the pinned version field — equal or
 //     differing values, both legal, even with unrelated members interleaved —
 //     so the bound version is never chosen by key order;
-//  2. two recognized spellings of the owning circuit field, under the same
+//  3. two recognized spellings of the owning circuit field, under the same
 //     rule — the circuit a job belongs to is never chosen by key order;
-//  3. an exact repeated member key (the first such key in document order,
+//  4. an exact repeated member key (the first such key in document order,
 //     including two byte-identical keys a member map could not retain);
-//  4. a duplicate key nested inside a member's own object/array value;
-//  5. an id token that would not read back unchanged — invalid UTF-8 bytes
+//  5. a duplicate key nested inside a member's own object/array value;
+//  6. an id token that would not read back unchanged — invalid UTF-8 bytes
 //     or an unpaired surrogate escape under the canonical "id" or any ASCII
 //     case spelling of it — so a saved job can never be re-read under a
 //     U+FFFD-repaired identity; the record is located positionally when the
@@ -388,6 +448,9 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 // those, so the historical precedence — every scan finding outranking every
 // binding finding — is preserved when several problems coexist.
 func (r *jobRecordScan) judge(where string) error {
+	if err := rejectAmbiguousJobID(r.positional, r.memberKeys()); err != nil {
+		return err
+	}
 	if err := rejectAmbiguousJobVersion(where, r.memberKeys()); err != nil {
 		return err
 	}
@@ -515,6 +578,26 @@ func scanJobArray(dec *json.Decoder) error {
 // exactly as written: "alpha" and "ALPHA" stay distinct circuits and no
 // whitespace is trimmed.
 //
+// The identity field is held to the same uniqueness rule, and with the
+// strictest attribution (rejectAmbiguousJobID): every spelling the ordinary
+// decode fills ID from counts as that one field (isJobIDKey) — canonical
+// "id", the three ASCII letter-case variants "ID", "Id" and "iD", and a
+// JSON-escaped spelling that unescapes onto any of them; "id" has no
+// non-ASCII case fold, so those four are exactly the recognized spellings.
+// Two such spellings on one record make the job's query id a function of
+// key order (encoding/json keeps the last value) and are refused as data
+// corruption whether the two values agree or differ, whether both are
+// present, non-empty and legal ids (legal Chinese, emoji and "�" included),
+// even when unrelated fields (circuit, version, attempt, …) are interleaved
+// between them, and even when neither spelling is the lowercase "id"
+// ("ID" beside "Id", …) — no combination of variants bypasses the rule and
+// two byte-identical spellings stay refused as well. Because the record
+// then has no settled identity, the error locates it by its 1-based position
+// in the jobs array ("job record #n") rather than quoting either candidate
+// value, and names the field by its canonical name "id". A single
+// recognized spelling keeps the current reading, and its value continues to
+// match exactly as written: no case folding, trimming or U+FFFD repair.
+//
 // The shared readJobRecord scan enforces every key and structural rule once
 // for both read passes; after it clears, this decode applies the rules the
 // scan cannot — the binding-field lookalike, at-most-one binding and its
@@ -561,11 +644,14 @@ func decodeJob(raw []byte, what string, out *persistJob) error {
 		where = fmt.Sprintf("stored job record %q", idProbe.ID)
 	}
 
-	// The scan-owned findings (version and circuit ambiguity, exact and
-	// nested duplicate keys) outrank every binding finding, exactly as when the directory scan
-	// ran ahead of this decode. (During an open the scan has already enforced
-	// them, so this is a no-op there; it keeps the single-record decoder
-	// self-contained.)
+	// The scan-owned findings (id, version and circuit ambiguity, exact and
+	// nested duplicate keys) outrank every binding finding, exactly as when
+	// the directory scan ran ahead of this decode. (During an open the scan
+	// has already enforced them, so this is a no-op there; it keeps the
+	// single-record decoder self-contained.) The id-ambiguity finding is
+	// always attributed positionally inside judge, so the probe-derived
+	// "where" (which may fold an "ID" variant) never labels a record that
+	// carries two ids with one of them.
 	if err := r.judge(where); err != nil {
 		return err
 	}
