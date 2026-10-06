@@ -712,9 +712,20 @@ type Store struct {
 // time and pinned for the store's lifetime: a relative path such as
 // "bench-data" names one fixed directory from the moment Open succeeds, and
 // later working-directory changes never redirect the store's reads, writes,
-// lock or Dir to another location. Paths to constraint definitions and input
-// files passed to individual operations are not pinned this way — they keep
-// being resolved against the caller's working directory at call time.
+// lock or Dir to another location. The same pinning applies through symbolic
+// links: when dir itself is a symlink, or any parent component is one, Open
+// resolves the link chain once and binds the store to the actual directory it
+// reached. Retargeting or removing the entry link afterwards never moves the
+// store onto the newly pointed-at data — reads, commits and Dir keep using
+// the directory that was actually opened, and a later Open through the
+// changed entry gets its own binding to wherever the entry points then. A ".."
+// component appearing after a symlink is followed the way the filesystem
+// would walk it (segment by segment through the resolved target), not by
+// folding the path text first. A data directory that does not exist yet is
+// created beneath the resolved actual parent. Paths to constraint
+// definitions and input files passed to individual operations are not pinned
+// this way — they keep being resolved against the caller's working directory
+// at call time.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, invalidf("data directory must not be empty")
@@ -722,13 +733,12 @@ func Open(dir string) (*Store, error) {
 	// Pin the location now: a relative path would otherwise be re-resolved
 	// against the process working directory on every later file access, so a
 	// chdir after Open could silently move the store onto a different
-	// bench-data. Abs (not EvalSymlinks) so a not-yet-existing directory can
-	// still be created below.
-	absDir, err := filepath.Abs(dir)
+	// bench-data. Likewise resolve symlinks once, so a retargeted entry link
+	// cannot redirect this store later.
+	dir, err := resolveDataDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
+		return nil, err
 	}
-	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create data directory %q: %w", dir, err)
 	}
@@ -758,6 +768,61 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
+// resolveDataDir turns the Open-time dir argument into the absolute path of
+// the actual directory the store will be bound to for its whole lifetime.
+//
+// The path is first made absolute against the current working directory, so a
+// later chdir cannot move it. Then every existing component is resolved the
+// way the filesystem walks it — symlink targets substituted segment by
+// segment, a ".." after a symlink interpreted relative to the link's target
+// rather than folded out of the path text — via filepath.EvalSymlinks on the
+// longest existing prefix. A trailing portion that does not exist yet (the
+// data directory still to be created, possibly under a symlinked parent) is
+// re-attached beneath the resolved prefix; with the prefix now link-free, no
+// later symlink change can redirect it. The result is what Dir reports and
+// what every read, write and lock of this store uses, so retargeting or
+// removing an entry link after Open has no effect on this instance.
+func resolveDataDir(dir string) (string, error) {
+	// Make the path absolute against the current working directory without
+	// cleaning it: filepath.Abs/filepath.Join would fold ".." out of the path
+	// text lexically, and a ".." after a symlink must instead be walked
+	// through the link's target the way the filesystem walks it.
+	absDir := dir
+	if !filepath.IsAbs(absDir) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
+		}
+		absDir = cwd + string(os.PathSeparator) + dir
+	}
+	// Find the longest existing prefix, collecting the not-yet-existing
+	// trailing components. The filesystem root always exists, so the walk
+	// terminates.
+	prefix := absDir
+	var suffix []string
+	for {
+		if _, err := os.Lstat(prefix); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("cannot inspect data directory %q: %w", dir, err)
+		}
+		parent := filepath.Dir(prefix)
+		if parent == prefix {
+			break
+		}
+		suffix = append([]string{filepath.Base(prefix)}, suffix...)
+		prefix = parent
+	}
+	resolved, err := filepath.EvalSymlinks(prefix)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve data directory %q: %w", dir, err)
+	}
+	if len(suffix) > 0 {
+		parts := append([]string{resolved}, suffix...)
+		resolved = filepath.Join(parts...)
+	}
+	return resolved, nil
+}
 // Close releases the directory lock. It does not discard committed data.
 func (s *Store) Close() error {
 	s.mu.Lock()
