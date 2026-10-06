@@ -21,8 +21,8 @@ import (
 //
 // This file is now the single home of a saved job's reading and validation
 // rules: the persistJob shape, the accepted spellings of its named fields
-// (id / version / compiled_hash), the id exact-readback rule, the
-// pinned-version uniqueness rule and the compiled-binding
+// (id / circuit / version / compiled_hash), the id exact-readback rule, the
+// owning-circuit and pinned-version uniqueness rules and the compiled-binding
 // duplicate/lookalike/type rules, together with one per-record reading engine (readJobRecord) both read passes drive. The
 // directory scan and the single-record decode hence tokenize one record once
 // and judge its keys and structure through the same code, which also covers
@@ -35,8 +35,9 @@ import (
 // points and the on-disk format stay as they were. In particular the two read
 // passes keep their historical division of labor and precedence because an
 // open always runs the directory scan before the typed decode: the scan owns
-// structural findings, the pinned-version ambiguity, exact repeated keys and
-// nested repeated keys (jobRecordScan.judge), while the typed decode owns the
+// structural findings, the pinned-version and owning-circuit ambiguities,
+// exact repeated keys and nested repeated keys (jobRecordScan.judge), while
+// the typed decode owns the
 // binding-field lookalike, duplicate-binding and binding-value-type findings
 // plus the ordinary struct decode (decodeJob).
 
@@ -58,6 +59,7 @@ type persistJob struct {
 // escape is judged on its decoded spelling too.
 const (
 	jobIDKey        = "id"
+	jobCircuitKey   = "circuit"
 	jobVersionKey   = "version"
 	compiledHashKey = "compiled_hash"
 )
@@ -92,6 +94,17 @@ func isASCIIFoldOf(key, canonical string) bool {
 // the u017f escape) names the field too.
 func isJobVersionKey(key string) bool {
 	return strings.EqualFold(key, jobVersionKey)
+}
+
+// isJobCircuitKey reports whether key names a job record's owning circuit
+// field under any spelling the ordinary decode fills Circuit from: canonical
+// "circuit" or an ASCII letter-case variant such as "CIRCUIT" or "CiRcUiT",
+// including a JSON-escaped spelling that unescapes onto either (keys arrive
+// here already unescaped). No non-ASCII rune case-folds onto any letter of
+// "circuit", so the ASCII fold and encoding/json's Unicode-folded tag
+// matching recognize exactly the same keys for this field.
+func isJobCircuitKey(key string) bool {
+	return isASCIIFoldOf(key, jobCircuitKey)
 }
 
 // isCompiledHashKey reports whether key is an accepted spelling of the
@@ -137,6 +150,45 @@ func rejectAmbiguousJobVersion(where string, keys []string) error {
 	}
 	return corruptf("%s carries the pinned version field %q more than once (as %s)",
 		where, jobVersionKey, strings.Join(quoted, ", "))
+}
+
+// rejectAmbiguousJobCircuit enforces the owning-circuit uniqueness rule shared
+// by the directory scan and the single-record decode (both drive readJobRecord):
+// the circuit a job names is the sole authority for which circuit the job
+// belongs to — and therefore which frozen version, trusted setup and compiled
+// artifact it is read against — so one record may carry the field under at
+// most one recognized spelling (isJobCircuitKey). Two spellings on one record
+// make the owning circuit depend on key order, since encoding/json keeps the
+// last value, and corrupt the read: the whole record is refused whether the
+// values agree or differ, whether both name legal circuits, and whether
+// unrelated members (the version, the attempt count, …) sit between them —
+// neither value is ever picked to carry on, and swapping the two keys never
+// changes the refusal. A single spelling of any recognized kind is the one
+// circuit field and keeps its current reading: the value is matched against
+// circuit names exactly as written, with no case folding or space trimming.
+//
+// keys are the record's member keys in any order; the recognized spellings are
+// filtered and sorted here so the message is deterministic. where names the
+// record exactly as the calling read path already located it (by id when the
+// scan read one, else by position), so both paths name the problem the same
+// way.
+func rejectAmbiguousJobCircuit(where string, keys []string) error {
+	var circuitKeys []string
+	for _, key := range keys {
+		if isJobCircuitKey(key) {
+			circuitKeys = append(circuitKeys, key)
+		}
+	}
+	if len(circuitKeys) <= 1 {
+		return nil
+	}
+	sort.Strings(circuitKeys)
+	quoted := make([]string, len(circuitKeys))
+	for i, k := range circuitKeys {
+		quoted[i] = strconv.Quote(k)
+	}
+	return corruptf("%s carries the circuit field %q more than once (as %s)",
+		where, jobCircuitKey, strings.Join(quoted, ", "))
 }
 
 // compiledHashLookalike reports a member key encoding/json would match onto
@@ -320,10 +372,12 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 //  1. two recognized spellings of the pinned version field — equal or
 //     differing values, both legal, even with unrelated members interleaved —
 //     so the bound version is never chosen by key order;
-//  2. an exact repeated member key (the first such key in document order,
+//  2. two recognized spellings of the owning circuit field, under the same
+//     rule — the circuit a job belongs to is never chosen by key order;
+//  3. an exact repeated member key (the first such key in document order,
 //     including two byte-identical keys a member map could not retain);
-//  3. a duplicate key nested inside a member's own object/array value;
-//  4. an id token that would not read back unchanged — invalid UTF-8 bytes
+//  4. a duplicate key nested inside a member's own object/array value;
+//  5. an id token that would not read back unchanged — invalid UTF-8 bytes
 //     or an unpaired surrogate escape under the canonical "id" or any ASCII
 //     case spelling of it — so a saved job can never be re-read under a
 //     U+FFFD-repaired identity; the record is located positionally when the
@@ -335,6 +389,9 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 // binding finding — is preserved when several problems coexist.
 func (r *jobRecordScan) judge(where string) error {
 	if err := rejectAmbiguousJobVersion(where, r.memberKeys()); err != nil {
+		return err
+	}
+	if err := rejectAmbiguousJobCircuit(where, r.memberKeys()); err != nil {
 		return err
 	}
 	if r.dupKey != "" {
@@ -445,6 +502,19 @@ func scanJobArray(dec *json.Decoder) error {
 // null, or a non-positive version — is rejected exactly as before, by the
 // ordinary decode or validateEnvelope.
 //
+// The owning circuit field is held to its own uniqueness rule
+// (rejectAmbiguousJobCircuit): every spelling the ordinary decode fills
+// Circuit from counts as that one field (isJobCircuitKey): canonical
+// "circuit" and ASCII letter-case variants such as "CIRCUIT" or "CiRcUiT",
+// JSON-escaped spellings included. Two such spellings on one record are
+// refused as data corruption whether the values agree or differ, whether
+// both name legal frozen circuits with trusted setups, and even when
+// unrelated fields are interleaved between them — the job's owning circuit
+// is never resolved by key order. A single recognized spelling keeps the
+// current reading, and the value keeps being matched against circuit names
+// exactly as written: "alpha" and "ALPHA" stay distinct circuits and no
+// whitespace is trimmed.
+//
 // The shared readJobRecord scan enforces every key and structural rule once
 // for both read passes; after it clears, this decode applies the rules the
 // scan cannot — the binding-field lookalike, at-most-one binding and its
@@ -491,8 +561,8 @@ func decodeJob(raw []byte, what string, out *persistJob) error {
 		where = fmt.Sprintf("stored job record %q", idProbe.ID)
 	}
 
-	// The scan-owned findings (version ambiguity, exact and nested duplicate
-	// keys) outrank every binding finding, exactly as when the directory scan
+	// The scan-owned findings (version and circuit ambiguity, exact and
+	// nested duplicate keys) outrank every binding finding, exactly as when the directory scan
 	// ran ahead of this decode. (During an open the scan has already enforced
 	// them, so this is a no-op there; it keeps the single-record decoder
 	// self-contained.)
