@@ -379,7 +379,11 @@ func (s *Store) RecordSetup(name string, version int) (Setup, error) {
 // half, …) to U+FFFD when the record is marshaled, so accepting them would
 // save the job under a different id than the caller submitted (and could
 // collide with an id that genuinely contains "�"). Such a request is refused
-// as ErrInvalidArgument before anything is committed. Circuit name and
+// as ErrInvalidArgument before anything is committed. The named circuit
+// carries the same validity rule: the saved circuit string is matched by
+// exact name against the frozen versions, so invalid byte sequences there
+// would be rewritten to U+FFFD at save time and pin the job to a different —
+// possibly existing — circuit. Circuit name and
 // version must be explicit and Attempt must be positive. Failure reasons are
 // distinguishable: ErrNotFound (version unknown), ErrNotFrozen (version is
 // still a draft) and ErrSetupMissing (no trusted setup for that version). A
@@ -406,6 +410,15 @@ func (s *Store) SubmitJob(job Job) (Job, error) {
 	}
 	if strings.TrimSpace(job.Circuit) == "" {
 		return Job{}, invalidf("job %q must name a circuit", job.ID)
+	}
+	// The owning circuit is matched by exact name, and encoding/json rewrites
+	// invalid byte sequences to U+FFFD when the record is marshaled: saving
+	// the job would pin it to a different circuit than the caller named, and
+	// the repaired name could collide with a circuit that genuinely contains
+	// "�". Refuse before anything is committed, the same rule the job id and
+	// a circuit's own name carry.
+	if !utf8.ValidString(job.Circuit) {
+		return Job{}, invalidf("job %q circuit name must be valid UTF-8: the submitted circuit contains invalid byte sequences (a lone continuation byte or a truncated multi-byte character) that would be rewritten to a replacement character when saved", job.ID)
 	}
 	if job.Version <= 0 {
 		return Job{}, invalidf("job %q must pin a positive circuit version", job.ID)

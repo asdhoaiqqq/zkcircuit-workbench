@@ -284,17 +284,20 @@ type jobMember struct {
 // shared rules need: the members in document order (exact spelling), the
 // first member key repeated under that same exact spelling, the best-effort
 // id used to name the record, any duplicate key nested inside a member's
-// own object/array value, and any exact-readback damage to the id token
-// (invalid UTF-8 bytes or an unpaired \uXXXX surrogate). Turning the members
-// into a typed persistJob is left to the ordinary struct decode, which runs
-// once afterwards.
+// own object/array value, exact-readback damage to the id token, and the raw
+// circuit token whose exact-readback check judge runs (invalid UTF-8 bytes
+// or an unpaired \uXXXX surrogate). Turning the members into a typed
+// persistJob is left to the ordinary struct decode, which runs once
+// afterwards.
 type jobRecordScan struct {
-	positional    string
-	members       []jobMember
-	dupKey        string
-	id            string
-	nestedErr     error
-	idEncodingErr error
+	positional     string
+	members        []jobMember
+	dupKey         string
+	id             string
+	nestedErr      error
+	idEncodingErr  error
+	circuitTok     json.RawMessage
+	circuitTokSeen bool
 }
 
 // scanName locates the record for a directory-scan finding: by its id when an
@@ -403,6 +406,29 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 					positional+` field "id"`, "committed job id")
 			}
 		}
+		// The circuit a job belongs to is the sole authority for which frozen
+		// version, trusted setup and compiled artifact the job is read
+		// against, so its saved token must read back exactly too. The token
+		// of every spelling the ordinary decode fills Circuit from
+		// (isJobCircuitKey: canonical "circuit", the ASCII case variants
+		// "CIRCUIT", "CiRcUiT", …, and any JSON-escaped spelling of them) is
+		// captured and judged in judge, where an intact id still names the
+		// record — unlike a damaged id, a damaged circuit value does not make
+		// the job unnameable. Invalid UTF-8 bytes or an unpaired \uXXXX
+		// surrogate would otherwise be silently rewritten to U+FFFD, so a
+		// damaged value could collide with a circuit that genuinely contains
+		// "�" and borrow that circuit's frozen version, setup and compiled
+		// artifact. Two recognized spellings are already refused above by
+		// rejectAmbiguousJobCircuit, which outranks this check; the first
+		// recognized token therefore is the one circuit field. A non-string
+		// value (null, a number …) is left to the ordinary decode's own
+		// failure: the encoding walk is defined only over one complete JSON
+		// string token.
+		if isJobCircuitKey(key) && !r.circuitTokSeen &&
+			bytes.HasPrefix(bytes.TrimSpace(value), []byte{'"'}) {
+			r.circuitTok = value
+			r.circuitTokSeen = true
+		}
 		if seenExact[key] && r.dupKey == "" {
 			r.dupKey = key
 		}
@@ -441,7 +467,13 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 //     or an unpaired surrogate escape under the canonical "id" or any ASCII
 //     case spelling of it — so a saved job can never be re-read under a
 //     U+FFFD-repaired identity; the record is located positionally when the
-//     id itself cannot be recovered faithfully.
+//     id itself cannot be recovered faithfully;
+//  7. a circuit token that would likewise not read back unchanged — invalid
+//     UTF-8 bytes or an unpaired surrogate escape under the canonical
+//     "circuit" or any ASCII case/JSON-escaped spelling of it — so a saved
+//     job's owning circuit is never repaired into another circuit's name and
+//     never borrows that circuit's frozen version, trusted setup or compiled
+//     artifact.
 //
 // The binding-field lookalike, duplicate-binding and binding-value-type rules
 // are deliberately not here: the typed decode (which runs after the scan) owns
@@ -465,6 +497,16 @@ func (r *jobRecordScan) judge(where string) error {
 	}
 	if r.idEncodingErr != nil {
 		return r.idEncodingErr
+	}
+	if r.circuitTokSeen {
+		// Run the walk at judgment time so the diagnostic names the record
+		// through where — by its id when the id read back intact, else by
+		// record position — and always quotes the field by its canonical
+		// name "circuit", whatever accepted spelling carried the token.
+		if err := checkStoredStringEncoding(r.circuitTok,
+			where+` field "circuit"`, "committed owning circuit name"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -577,6 +619,23 @@ func scanJobArray(dec *json.Decoder) error {
 // current reading, and the value keeps being matched against circuit names
 // exactly as written: "alpha" and "ALPHA" stay distinct circuits and no
 // whitespace is trimmed.
+//
+// Beyond uniqueness, that one circuit value carries the same exact-readback
+// rule the id does: its raw JSON string token must denote the owning circuit
+// exactly — valid UTF-8 in its literal portions and no unpaired \uXXXX
+// surrogate escapes under every spelling isJobCircuitKey recognizes. Both
+// damage shapes decode to U+FFFD under encoding/json, so without the check a
+// job saved with a truncated multi-byte sequence or a lone \uD800 escape
+// could read back as if it named a different circuit that genuinely contains
+// "�" — and, when that other version is frozen with a trusted setup and a
+// compiled artifact, the job would then successfully borrow its version,
+// setup and artifact. The owning circuit must be determined by the saved
+// bytes alone, so such a record is data corruption: the read is refused,
+// named by the job (by its id when legible, else by record position) and the
+// circuit field, even when the repaired name exists and everything it would
+// resolve to is in place. A legal Chinese or emoji value, an actually
+// committed "�", a correctly paired surrogate and the literal six-character
+// text \uD800 are all ordinary circuit values that keep their exact spelling.
 //
 // The identity field is held to the same uniqueness rule, and with the
 // strictest attribution (rejectAmbiguousJobID): every spelling the ordinary
