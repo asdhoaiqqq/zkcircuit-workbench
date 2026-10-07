@@ -12,20 +12,81 @@ import (
 // Reading rules for a saved trusted-setup record.
 //
 // A setup belongs exclusively to the frozen circuit version named in the
-// record, and the "version" it carries is the sole authority for which version
-// that is. This file gives the directory scan one per-record reader for the
-// envelope's "setups" array (scanSetupArray) so that, just as for job records,
-// every spelling the ordinary struct decode would fill Version from counts as
-// the same one field and may appear at most once in a record.
+// record, and both members that pin that binding carry a uniqueness rule. The
+// "version" is the sole authority for which version the setup is for, and the
+// "name" is the sole authority for which circuit owns it: just as a doubled
+// version could rebind the setup across two frozen versions of one circuit, a
+// doubled circuit name (canonical "name" beside an ASCII case variant such as
+// "NAME") would let encoding/json keep the last value and rebind a setup
+// registered only for circuit a onto a likewise-frozen circuit b. This file
+// gives the directory scan one per-record reader for the envelope's "setups"
+// array (scanSetupArray) so that, just as for job records, every spelling the
+// ordinary struct decode fills Version or Name from counts as that one field
+// and may appear at most once in a record.
 //
 // Keys reach every rule below already JSON-unescaped, so a key written with a
-// \uXXXX escape is judged on its decoded spelling too. Only the version field
-// gets this uniqueness rule; a setup record's other member keeps its prior
-// reading behavior.
+// \uXXXX escape is judged on its decoded spelling too. Only the name and
+// version fields get these uniqueness rules; a setup record's other members
+// keep their prior reading behavior.
 
 type persistSetup struct {
 	Name    string `json:"name"`
 	Version int    `json:"version"`
+}
+
+// setupNameKey is the canonical wire spelling of the field naming the circuit
+// a setup belongs to.
+const setupNameKey = "name"
+
+// isSetupNameKey reports whether key names a setup record's owning-circuit
+// field under any spelling the ordinary struct decode fills Name from:
+// canonical "name" or an ASCII letter-case variant such as "NAME" or "NaMe",
+// including a JSON-escaped spelling that unescapes onto either (keys arrive
+// here already unescaped). No non-ASCII rune case-folds onto any letter of
+// "name" under encoding/json's Unicode-folded tag matching either, so the
+// ASCII fold recognizes exactly the keys that bind to the field.
+func isSetupNameKey(key string) bool {
+	return isASCIIFoldOf(key, setupNameKey)
+}
+
+// rejectAmbiguousSetupName enforces the owning-circuit-name uniqueness rule on
+// one saved setup record: the name decides which circuit the setup belongs to,
+// so one record may carry the field under at most one recognized spelling
+// (isSetupNameKey) — canonical "name", an ASCII letter-case variant, or a
+// JSON-escaped spelling that unescapes onto either. Two spellings on one record
+// make the owning circuit depend on key order, since encoding/json keeps the
+// last value, and corrupt the whole directory read: the record is refused
+// whether the two values agree or differ (a setup registered only for a whose
+// record also names b is exactly the dangerous case, with a and b both frozen
+// at version 1), whether both name circuits that exist and are frozen, whether
+// the two keys are adjacent or the version sits between them, and in whichever
+// key order they appear. A record carrying only case variants with no
+// lowercase "name" ("NAME" beside "Name", …) is refused on the same terms, and
+// two byte-identical spellings are covered as well. A single spelling of any
+// recognized kind is the one name field and keeps its current reading.
+//
+// keys are the record's member keys in any order; the recognized spellings are
+// filtered and sorted here so the message is deterministic. where names the
+// record positionally ("setup record #<1-based index>"): the record refuses to
+// settle which circuit it belongs to, so the finding is never attributed to
+// either candidate name.
+func rejectAmbiguousSetupName(where string, keys []string) error {
+	var nameKeys []string
+	for _, key := range keys {
+		if isSetupNameKey(key) {
+			nameKeys = append(nameKeys, key)
+		}
+	}
+	if len(nameKeys) <= 1 {
+		return nil
+	}
+	sort.Strings(nameKeys)
+	quoted := make([]string, len(nameKeys))
+	for i, k := range nameKeys {
+		quoted[i] = strconv.Quote(k)
+	}
+	return corruptf("%s carries the circuit name field %q more than once (as %s); the circuit a trusted setup belongs to must not depend on field order",
+		where, setupNameKey, strings.Join(quoted, ", "))
 }
 
 // setupVersionKey is the canonical wire spelling of the field naming the
@@ -85,8 +146,8 @@ func rejectAmbiguousSetupVersion(where string, keys []string) error {
 
 // scanSetupArray consumes one "setups" value positioned at its opening bracket
 // and reads every record through its own per-record engine, naming each
-// structural problem, repeated member key or ambiguous version field before
-// the scan moves on. It is the setup counterpart of scanJobArray and
+// structural problem, repeated member key or ambiguous name/version field
+// before the scan moves on. It is the setup counterpart of scanJobArray and
 // scanCircuitArray: a problem inside one setup is attributed to that record by
 // its 1-based position ("setup record #n") rather than to an opaque "setups"
 // element index. A null array stays the pre-existing "no setups" reading.
@@ -126,10 +187,10 @@ func scanSetupArray(dec *json.Decoder) error {
 // A null or scalar element (a number, a string, …) is structurally legal JSON
 // and stays left to the typed decode and validateEnvelope, which already
 // reject it; only object and array elements carry member keys to judge. For an
-// object the shallow member keys drive the version-uniqueness rule, and every
-// member value — plus a nested array element — is still walked for its own
-// duplicate keys, so the scan loses none of the envelope-wide repeated-key
-// coverage it had through skipValueWithDupKeys.
+// object the shallow member keys drive the name and version uniqueness rules,
+// and every member value — plus a nested array element — is still walked for
+// its own duplicate keys, so the scan loses none of the envelope-wide
+// repeated-key coverage it had through skipValueWithDupKeys.
 func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -169,9 +230,9 @@ func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) 
 		if err := dec.Decode(&value); err != nil {
 			return corruptf("%s is not valid JSON: %v", positional, err)
 		}
-		// The version ambiguity outranks an exact repetition of another member,
-		// matching the job record precedence; the first exact repeated key is
-		// remembered for the subsequent finding.
+		// The name and version ambiguities outrank an exact repetition of
+		// another member, matching the job record precedence; the first exact
+		// repeated key is remembered for the subsequent finding.
 		if seenExact[key] && dupKey == "" {
 			dupKey = key
 		}
@@ -188,6 +249,9 @@ func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) 
 	}
 	if closeTok, err := dec.Token(); err != nil || closeTok != json.Delim('}') {
 		return corruptf("%s is not valid JSON", positional)
+	}
+	if err := rejectAmbiguousSetupName(positional, keys); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousSetupVersion(positional, keys); err != nil {
 		return err
