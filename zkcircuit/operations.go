@@ -343,9 +343,21 @@ func (s *Store) CopyCircuit(name string, version, toVersion int) (Circuit, error
 // record belongs exclusively to that name+version. Unknown versions yield
 // ErrNotFound; non-frozen versions yield ErrNotFrozen. Re-registering a
 // setup for the same version is idempotent and adds no duplicate record.
+//
+// The name must be complete, valid UTF-8: it is the sole authority for which
+// circuit the saved setup belongs to, and encoding/json silently rewrites
+// invalid byte sequences (a lone continuation byte, a truncated multi-byte
+// character, an encoded surrogate half, …) to U+FFFD when the record is
+// marshaled — accepting them would register the setup under a repaired name
+// that may belong to a genuinely different circuit (one whose real name
+// contains "�"). Such a request is refused as ErrInvalidArgument before
+// anything is committed.
 func (s *Store) RecordSetup(name string, version int) (Setup, error) {
 	if err := validateCircuitKey(name, version); err != nil {
 		return Setup{}, err
+	}
+	if !utf8.ValidString(name) {
+		return Setup{}, invalidf("setup circuit name must be valid UTF-8: the submitted name contains invalid byte sequences (a lone continuation byte or a truncated multi-byte character) that would be rewritten to a replacement character when saved")
 	}
 
 	var result Setup

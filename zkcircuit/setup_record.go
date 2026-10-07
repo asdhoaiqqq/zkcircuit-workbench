@@ -28,6 +28,17 @@ import (
 // \uXXXX escape is judged on its decoded spelling too. Only the name and
 // version fields get these uniqueness rules; a setup record's other members
 // keep their prior reading behavior.
+//
+// Beyond uniqueness the one name value carries an exact-readback rule
+// (checkStoredStringEncoding, applied in judgeSetupRecord): its raw JSON
+// string token must denote the owning circuit exactly — valid UTF-8 in the
+// literal portions and no unpaired \uXXXX surrogate escapes — under canonical
+// "name", an ASCII letter-case variant or a JSON-escaped spelling alike.
+// encoding/json rewrites both damage shapes to U+FFFD, so without the check a
+// record could read as a setup for a different, genuinely-existing frozen
+// circuit whose name contains "�", and proof jobs against that circuit would
+// pass the trusted-setup check. Such a record is data corruption located by
+// the setup record's 1-based position and the name field.
 
 type persistSetup struct {
 	Name    string `json:"name"`
@@ -146,11 +157,13 @@ func rejectAmbiguousSetupVersion(where string, keys []string) error {
 
 // scanSetupArray consumes one "setups" value positioned at its opening bracket
 // and reads every record through its own per-record engine, naming each
-// structural problem, repeated member key or ambiguous name/version field
-// before the scan moves on. It is the setup counterpart of scanJobArray and
-// scanCircuitArray: a problem inside one setup is attributed to that record by
-// its 1-based position ("setup record #n") rather than to an opaque "setups"
-// element index. A null array stays the pre-existing "no setups" reading.
+// structural problem, repeated member key, ambiguous name/version field or a
+// name value whose raw token would not read back unchanged (invalid UTF-8
+// bytes, an unpaired surrogate escape) before the scan moves on. It is the
+// setup counterpart of scanJobArray and scanCircuitArray: a problem inside
+// one setup is attributed to that record by its 1-based position ("setup
+// record #n") rather than to an opaque "setups" element index. A null array
+// stays the pre-existing "no setups" reading.
 func scanSetupArray(dec *json.Decoder) error {
 	tok, err := dec.Token()
 	if err != nil {
@@ -188,9 +201,11 @@ func scanSetupArray(dec *json.Decoder) error {
 // and stays left to the typed decode and validateEnvelope, which already
 // reject it; only object and array elements carry member keys to judge. For an
 // object the shallow member keys drive the name and version uniqueness rules,
-// and every member value — plus a nested array element — is still walked for
-// its own duplicate keys, so the scan loses none of the envelope-wide
-// repeated-key coverage it had through skipValueWithDupKeys.
+// the one recognized name value is exact-readback checked over its raw token
+// (invalid UTF-8 bytes and unpaired surrogate escapes), and every member value
+// — plus a nested array element — is still walked for its own duplicate keys,
+// so the scan loses none of the envelope-wide repeated-key coverage it had
+// through skipValueWithDupKeys.
 func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -214,6 +229,8 @@ func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) 
 		return corruptf("%s is not valid JSON", positional)
 	}
 	var keys []string
+	var nameTok json.RawMessage
+	nameTokSeen := false
 	seenExact := make(map[string]bool)
 	dupKey := ""
 	var nestedErr error
@@ -229,6 +246,21 @@ func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) 
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
 			return corruptf("%s is not valid JSON: %v", positional, err)
+		}
+		// The name is the sole authority for which circuit the setup belongs
+		// to and must read back exactly as the bytes on disk carry it, under
+		// every spelling the ordinary decode fills Name from (isSetupNameKey:
+		// canonical "name", an ASCII letter-case variant such as "NAME", and a
+		// JSON-\u-escaped spelling of either). The first recognized token is
+		// captured for the exact-readback walk below: two recognized
+		// spellings are already refused by rejectAmbiguousSetupName, which
+		// outranks this check. A non-string value (null, a number …) is left
+		// to the typed decode and validateEnvelope — the walk is defined only
+		// over one complete JSON string token.
+		if isSetupNameKey(key) && !nameTokSeen &&
+			bytes.HasPrefix(bytes.TrimSpace(value), []byte{'"'}) {
+			nameTok = value
+			nameTokSeen = true
 		}
 		// The name and version ambiguities outrank an exact repetition of
 		// another member, matching the job record precedence; the first exact
@@ -261,6 +293,21 @@ func judgeSetupRecord(raw json.RawMessage, positional string, elementIndex int) 
 	}
 	if nestedErr != nil {
 		return nestedErr
+	}
+	// encoding/json silently rewrites invalid UTF-8 bytes in the literal
+	// portions of the name token and unpaired \uXXXX surrogate escapes to
+	// U+FFFD, which would let a damaged setup record read as belonging to a
+	// different circuit — one whose genuine name contains "�" — and pass the
+	// trusted-setup gate for that circuit's proof jobs when it is frozen. The
+	// owning circuit must be determined by the saved bytes alone, so such a
+	// record is data corruption even when the repaired name exists, that
+	// version is frozen and a setup for it is otherwise in place. The field is
+	// always quoted by its canonical name "name", whatever accepted spelling
+	// carried the token.
+	if nameTokSeen {
+		if err := checkStoredStringEncoding(nameTok, positional+` field "name"`, "committed setup circuit name"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
