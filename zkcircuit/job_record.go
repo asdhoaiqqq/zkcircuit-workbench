@@ -21,8 +21,9 @@ import (
 //
 // This file is now the single home of a saved job's reading and validation
 // rules: the persistJob shape, the accepted spellings of its named fields
-// (id / circuit / version / compiled_hash), the id exact-readback rule, the
-// owning-circuit and pinned-version uniqueness rules and the compiled-binding
+// (id / circuit / version / compiled_hash), the id and owning-circuit
+// exact-readback rules, the owning-circuit and pinned-version uniqueness
+// rules and the compiled-binding
 // duplicate/lookalike/type rules, together with one per-record reading engine (readJobRecord) both read passes drive. The
 // directory scan and the single-record decode hence tokenize one record once
 // and judge its keys and structure through the same code, which also covers
@@ -284,8 +285,10 @@ type jobMember struct {
 // shared rules need: the members in document order (exact spelling), the
 // first member key repeated under that same exact spelling, the best-effort
 // id used to name the record, any duplicate key nested inside a member's
-// own object/array value, and any exact-readback damage to the id token
-// (invalid UTF-8 bytes or an unpaired \uXXXX surrogate). Turning the members
+// own object/array value, any exact-readback damage to the id token
+// (invalid UTF-8 bytes or an unpaired \uXXXX surrogate), and the raw token
+// of the owning-circuit value, whose own exact-readback judgment is made at
+// judge time when the record's settled name is known. Turning the members
 // into a typed persistJob is left to the ordinary struct decode, which runs
 // once afterwards.
 type jobRecordScan struct {
@@ -295,6 +298,7 @@ type jobRecordScan struct {
 	id            string
 	nestedErr     error
 	idEncodingErr error
+	circuitRaw    json.RawMessage
 }
 
 // scanName locates the record for a directory-scan finding: by its id when an
@@ -403,6 +407,24 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 					positional+` field "id"`, "committed job id")
 			}
 		}
+		// The owning circuit is held to the same exact-readback rule as the
+		// id: it is the sole authority for which circuit — and thereby which
+		// frozen version, trusted setup and compiled artifact — the job is
+		// read against, so its raw token must denote its value exactly.
+		// encoding/json silently rewrites invalid UTF-8 bytes and unpaired
+		// \uXXXX surrogate escapes to U+FFFD, which could land the job on a
+		// circuit the bytes on disk never named (one genuinely called
+		// "电路�", say), borrowing that circuit's version, setup and
+		// compiled artifact. The raw token of the first string-valued
+		// circuit spelling (isJobCircuitKey: canonical "circuit", the ASCII
+		// case variants, a JSON-escaped spelling of either) is kept here and
+		// judged at judge time, when the record's settled name is known. A
+		// non-string value (null, a number …) is left to the ordinary
+		// decode's own failure, exactly as for the id.
+		if r.circuitRaw == nil && isJobCircuitKey(key) &&
+			bytes.HasPrefix(bytes.TrimSpace(value), []byte{'"'}) {
+			r.circuitRaw = value
+		}
 		if seenExact[key] && r.dupKey == "" {
 			r.dupKey = key
 		}
@@ -441,7 +463,14 @@ func readJobRecord(dec *json.Decoder, positional string) (*jobRecordScan, error)
 //     or an unpaired surrogate escape under the canonical "id" or any ASCII
 //     case spelling of it — so a saved job can never be re-read under a
 //     U+FFFD-repaired identity; the record is located positionally when the
-//     id itself cannot be recovered faithfully.
+//     id itself cannot be recovered faithfully;
+//  7. a circuit token that would not read back unchanged — invalid UTF-8
+//     bytes or an unpaired surrogate escape under the canonical "circuit"
+//     or any recognized spelling of it — so a saved job can never be
+//     re-read as owned by a U+FFFD-repaired circuit name and borrow that
+//     circuit's frozen version, trusted setup or compiled artifact. The
+//     record is named by its id when that is legible (the id is not the
+//     damaged field here), else positionally.
 //
 // The binding-field lookalike, duplicate-binding and binding-value-type rules
 // are deliberately not here: the typed decode (which runs after the scan) owns
@@ -465,6 +494,15 @@ func (r *jobRecordScan) judge(where string) error {
 	}
 	if r.idEncodingErr != nil {
 		return r.idEncodingErr
+	}
+	if r.circuitRaw != nil {
+		// The field is always quoted by its canonical name "circuit" in the
+		// diagnostic, whatever accepted spelling the damaged token was
+		// written under (a "CIRCUIT" variant, a \uXXXX-escaped key).
+		if err := checkStoredStringEncoding(r.circuitRaw,
+			where+` field "circuit"`, "committed circuit name"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -577,6 +615,22 @@ func scanJobArray(dec *json.Decoder) error {
 // current reading, and the value keeps being matched against circuit names
 // exactly as written: "alpha" and "ALPHA" stay distinct circuits and no
 // whitespace is trimmed.
+//
+// The circuit value is also held to the same exact-readback rule as the id:
+// its raw JSON string token must denote its value exactly — valid UTF-8 in
+// the literal portions and no unpaired \uXXXX surrogate escapes — under any
+// spelling the ordinary decode fills Circuit from. Both damage shapes decode
+// to U+FFFD under encoding/json, so the job would read back as owned by a
+// repaired name the bytes on disk never carried: when a circuit genuinely
+// named with "�" exists (frozen, set up, even compiled), the damaged job
+// would silently borrow that circuit's version, trusted setup and compiled
+// artifact. Such a record is data corruption whoever the replacement name
+// happens to match: the read is refused naming the job and the circuit
+// field, no partial results are returned and the file is never rewritten. A
+// real "�", Chinese, emoji, a correctly paired surrogate and the literal
+// text \uD800 all stay ordinary circuit names. The shared readJobRecord
+// engine captures the raw token and judge applies the rule for both read
+// passes.
 //
 // The identity field is held to the same uniqueness rule, and with the
 // strictest attribution (rejectAmbiguousJobID): every spelling the ordinary
