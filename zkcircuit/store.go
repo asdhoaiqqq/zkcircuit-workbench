@@ -189,15 +189,15 @@ func envelopeFieldLookalike(key string) string {
 // spelling or an ASCII case variant, in either order and whether the values
 // agree. The error names both the standard field and the actual spelling.
 //
-// Circuit and job records are scanned one record at a time through their
-// shared per-record readers — the record's own top-level keys are checked
-// here (with the record's 1-based index, or the job's id, reported) by
-// scanCircuitArray and the shared job reader scanJobArray in job_record.go,
-// while a nested value such as a constraint definition or an unknown job
-// member's object is skipped and left to its own strict decoder. Every other
-// envelope member is scanned recursively so a duplicated key anywhere in
-// committed data fails the read instead of silently resolving to its last
-// value.
+// Circuit, setup and job records are scanned one record at a time through
+// their shared per-record readers — the record's own top-level keys are
+// checked here (with the record's 1-based index, or the job's id, reported)
+// by scanCircuitArray, scanSetupArray in setup_record.go and scanJobArray in
+// job_record.go, while a nested value such as a constraint definition or an
+// unknown member's object is skipped and left to its own strict decoder.
+// Every other envelope member is scanned recursively so a duplicated key
+// anywhere in committed data fails the read instead of silently resolving to
+// its last value.
 func scanEnvelopeDuplicates(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
 	dec.UseNumber()
@@ -245,6 +245,12 @@ func scanEnvelopeDuplicates(raw []byte) error {
 				}
 				continue
 			}
+			if canonical == "setups" {
+				if err := scanSetupArray(dec); err != nil {
+					return err
+				}
+				continue
+			}
 			if canonical == "jobs" {
 				if err := scanJobArray(dec); err != nil {
 					return err
@@ -280,6 +286,14 @@ func skipValueWithDupKeys(dec *json.Decoder, what string) error {
 	if err != nil {
 		return corruptf("%s is not valid JSON: %v", what, err)
 	}
+	return skipValueRest(dec, tok, what)
+}
+
+// skipValueRest consumes the remainder of one JSON value whose first token
+// has already been read, recursively rejecting duplicate object keys. It lets
+// a caller that needs the opening token for its own judgment (the setup
+// record scan) share the same recursive walk.
+func skipValueRest(dec *json.Decoder, tok any, what string) error {
 	delim, ok := tok.(json.Delim)
 	if !ok {
 		return nil // scalar (including null)
@@ -350,11 +364,6 @@ type persistArtifact struct {
 	Modulus     int64  `json:"modulus"`
 	Constraints int    `json:"constraints"`
 	Hash        string `json:"hash"`
-}
-
-type persistSetup struct {
-	Name    string `json:"name"`
-	Version int    `json:"version"`
 }
 
 // Store is a persistent workbench backed by one local data directory.
